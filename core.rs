@@ -487,6 +487,53 @@ pub fn run_core(
     })
 }
 
+struct SearchFunctionCall<'tcx> {
+    inner_functions: Vec<rustc_middle::mir::Operand<'tcx>>,
+}
+
+impl<'tcx> SearchFunctionCall<'tcx> {
+    fn new() -> Self {
+        SearchFunctionCall {
+            inner_functions: Vec::new(),
+        }
+    }
+}
+
+// impl<'tcx> Visitor<'tcx> for SearchFunctionCall<'tcx> {
+//     type Map = Map<'tcx>;
+// 
+//     fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
+//         NestedVisitorMap::All(self.tcx.hir())
+//     }
+// 
+//     fn visit_path(&mut self, path: &'tcx Path<'_>, id: HirId) {
+//         debug!("visiting path {:?}", path);
+//         let hir = self.tcx.hir();
+//         let node = hir.get(id);
+//         dbg!(node);
+//         dbg!(node.ident());
+//         if node.fn_decl().is_some() {
+//             eprintln!("adding: {}", self.tcx.def_path_str(hir.local_def_id(id).to_def_id()));
+//             self.inner_functions.push(id);
+//         }
+//         // We could have an outer resolution that succeeded,
+//         // but with generic parameters that failed.
+//         // Recurse into the segments so we catch those too.
+//         intravisit::walk_path(self, path);
+//     }
+// }
+
+use rustc_middle::mir::terminator::*;
+use rustc_middle::mir::Location;
+impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for SearchFunctionCall<'tcx> {
+    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, _location: Location) {
+        if let TerminatorKind::Call{func, ..} = &terminator.kind {
+            // dbg!(func, args, destination, cleanup, from_hir_call, fn_span);
+            self.inner_functions.push(func.clone());
+        }
+    }
+}
+
 fn run_global_ctxt(
     tcx: TyCtxt<'_>,
     resolver: Rc<RefCell<interface::BoxedResolver>>,
@@ -495,6 +542,44 @@ fn run_global_ctxt(
     render_options: RenderOptions,
     output_format: Option<OutputFormat>,
 ) -> (clean::Crate, RenderInfo, RenderOptions) {
+    let hir = tcx.hir();
+    let krate = hir.krate();
+    for body in krate.body_ids.iter() {
+        // let _module = dbg!(tcx.def_path_str(tcx.parent_module(body.hir_id).to_def_id()));
+        // let _function_name = dbg!(tcx.def_path_str(body.hir_id.owner.to_def_id()));
+        // let _body = dbg!(&krate.body(*body).value.kind);
+        // let _subfunctions = dbg!(SearchFunctionCall::new(tcx).visit_body(hir.body(*body)));
+
+        let _ = body;
+    }
+
+    eprintln!("strict digraph {{");
+    for owner in tcx.body_owners() {
+        // dbg!(tcx.item_name(owner.to_def_id()));
+        // dbg!(tcx.def_path(owner.to_def_id()));
+        // let _kind = dbg!(hir.def_kind(owner));
+
+        let mir = tcx.mir_built(rustc_middle::ty::WithOptConstParam {
+            did: owner,
+            const_param_did: tcx.opt_const_param_of(owner)
+        });
+        use crate::rustc_middle::mir::visit::Visitor;
+        let mut subfunctions = SearchFunctionCall::new();
+        subfunctions.visit_body(&mir.borrow());
+
+        let caller = tcx.def_path_str(owner.to_def_id());
+        for subfunction in subfunctions.inner_functions {
+            use rustc_middle::mir::Operand;
+            eprintln!("\"{}\" -> \"{}\"", caller, match subfunction {
+                Operand::Constant(ref a) => format!("cst {:?}", a),
+                Operand::Copy(ref place) => format!("copy {:?}", place),
+                Operand::Move(ref place) => format!("move {:?}", place),
+            });
+        }
+        eprintln!();
+    }
+    eprintln!("}}");
+
     // Certain queries assume that some checks were run elsewhere
     // (see https://github.com/rust-lang/rust/pull/73566#issuecomment-656954425),
     // so type-check everything other than function bodies in this crate before running lints.

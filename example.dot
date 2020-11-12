@@ -1,0 +1,111 @@
+strict digraph {
+    "main" -> "m1::foo3::<fn() {m2::bar}>" [arrowhead=None]
+    "main" -> "m1::foo1::<fn() {m2::bar}>" [arrowhead=None]
+
+    "m1::foo1" -> "m1::foo2::<F>" [arrowhead=None]
+
+    "m1::foo2" -> "<F as std::ops::Fn<()>>::call"
+
+    "m1::foo3" -> "m1::foo2::<F>" [arrowhead=None]
+
+    "m2::bar" -> "m2::baz"
+
+    "m2::baz" -> "std::fmt::Arguments::new_v1"
+    "m2::baz" -> "std::io::_print"
+
+    // indirect call
+
+    "m1::foo3::<fn() {m2::bar}>" -> "m1::foo3"
+    "m1::foo3" -> "m1::foo3::<fn() {m2::bar}>" [style=dotted; constraint=false] [arrowhead=None]
+    "m1::foo1::<fn() {m2::bar}>" -> "m1::foo1"
+    "m1::foo1" -> "m1::foo1::<fn() {m2::bar}>" [style=dotted; constraint=false] [arrowhead=None]
+
+    "m1::foo2::<F>" -> "m1::foo2"
+    "m1::foo2" -> "m1::foo2::<F>" [style=dotted; constraint=false] [arrowhead=None]
+
+    "m1::foo2::<F>" -> "m1::foo1" [style=dotted; constraint=false]
+    "m1::foo2::<F>" -> "m1::foo3" [style=dotted; constraint=false]
+
+    "<F as std::ops::Fn<()>>::call" -> "m1::foo2" [style=dotted; constraint=false]
+
+    "m1::foo3::<fn() {m2::bar}>" -> "m2::bar" [style=dotted; constraint=false]
+    "m1::foo1::<fn() {m2::bar}>" -> "m2::bar" [style=dotted; constraint=false]
+
+    // virtual node
+
+    "m1::foo3::<fn() {m2::bar}>" [label=""; fixedsize="false"; width=0; height=0; shape=none]
+    "m1::foo1::<fn() {m2::bar}>" [label=""; fixedsize="false"; width=0; height=0; shape=none]
+    "m1::foo2::<F>" [label=""; fixedsize="false"; width=0; height=0; shape=none]
+
+    // subgraph name
+
+    subgraph cluster0 {
+        label = <<u>test1</u>>
+        fontcolor = green
+        color = none
+        subgraph cluster1 {
+            label = <<u>m1</u>>
+            fontcolor = green
+            color = green
+        }
+        subgraph cluster2 {
+            label = <<u>m2</u>>
+            fontcolor = green
+            color = green
+        }
+    }
+    subgraph cluster3 {
+        label = <<u>std</u>>
+        fontcolor = blue
+        color = blue
+    }
+
+    // subgraph nodes
+
+    subgraph cluster0 {
+        "main" [shape=none]
+
+        subgraph cluster1 {
+            "m1::foo1" [shape=none]
+            "m1::foo2" [shape=none]
+            "m1::foo3" [shape=none]
+
+            "m1::foo3::<fn() {m2::bar}>" [shape=none]
+            "m1::foo1::<fn() {m2::bar}>" [shape=none]
+            "m1::foo2::<F>" [shape=none]
+            "<F as std::ops::Fn<()>>::call" [shape=none]
+        }
+
+        subgraph cluster2 {
+            "m2::bar" [shape=none]
+            "m2::baz" [shape=none]
+        }
+    }
+    subgraph cluster3 {
+        "std::fmt::Arguments::new_v1" [shape=none]
+        "std::io::_print" [shape=none]
+    }
+
+    // documentation
+
+    subgraph cluster0 {
+        href="target/doc/test1/index.html"
+        "main" [href="target/doc/test1/index.html"]
+
+        subgraph cluster1·
+        {
+            href="target/doc/test1/m1/index.html"
+            "m1::foo1" [href="target/doc/test1/m1/fn.foo1.html"]
+            "m1::foo2" [href="target/doc/test1/m1/fn.foo2.html"]
+            "m1::foo3" [href="target/doc/test1/m1/fn.foo3.html"]
+        }
+
+        subgraph cluster2·
+        {
+            href="target/doc/test1/m2/index.html"
+            "m2::bar" [href="target/doc/test1/m2/fn.bar.html"]
+            "m2::baz" [href="target/doc/test1/m2/fn.baz.html"]
+        }
+    }
+}
+

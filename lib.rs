@@ -96,8 +96,6 @@ pub fn main() {
     process::exit(exit_code);
 }
 
-// Taken from
-// https://github.com/rust-lang/miri/blob/master/src/bin/miri.rs
 /// Returns the "default sysroot" that will be used if no `--sysroot` flag is set.
 /// Should be a compile-time constant.
 fn compile_time_sysroot() -> Option<String> {
@@ -124,7 +122,7 @@ fn compile_time_sysroot() -> Option<String> {
     Some(match (home, toolchain) {
         (Some(home), Some(toolchain)) => format!("{}/toolchains/{}", home, toolchain),
         _ => option_env!("RUST_SYSROOT")
-            .expect("To build rustdoc without rustup, set the `RUST_SYSROOT` env var at build time")
+            .expect("To build Miri without rustup, set the `RUST_SYSROOT` env var at build time")
             .to_owned(),
     })
 }
@@ -179,7 +177,7 @@ where
 
 fn opts() -> Vec<RustcOptGroup> {
     vec![
-        stable("h", |o| o.optflag("h", "help", "show this help message")),
+        stable("h", |o| o.optflag("h", "help", "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")),
         stable("V", |o| o.optflag("V", "version", "print rustdoc's version")),
         stable("v", |o| o.optflag("v", "verbose", "use verbose output")),
         stable("r", |o| {
