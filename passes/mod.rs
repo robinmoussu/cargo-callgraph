@@ -139,20 +139,6 @@ pub enum DefaultPassOption {
     None,
 }
 
-/// Returns the given default set of passes.
-pub fn defaults(default_set: DefaultPassOption) -> &'static [ConditionalPass] {
-    match default_set {
-        DefaultPassOption::Default => DEFAULT_PASSES,
-        DefaultPassOption::Coverage => COVERAGE_PASSES,
-        DefaultPassOption::None => &[],
-    }
-}
-
-/// If the given name matches a known pass, returns its information.
-pub fn find_pass(pass_name: &str) -> Option<Pass> {
-    PASSES.iter().find(|p| p.name == pass_name).copied()
-}
-
 /// Returns a span encompassing all the given attributes.
 crate fn span_of_attrs(attrs: &clean::Attributes) -> Option<Span> {
     if attrs.doc_strings.is_empty() {

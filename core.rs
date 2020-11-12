@@ -23,7 +23,6 @@ use rustc_session::lint;
 use rustc_session::DiagnosticOutput;
 use rustc_session::Session;
 use rustc_span::source_map;
-use rustc_span::symbol::sym;
 use rustc_span::DUMMY_SP;
 
 use std::cell::RefCell;
@@ -31,10 +30,10 @@ use std::mem;
 use std::rc::Rc;
 
 use crate::clean;
-use crate::clean::{AttributesExt, MAX_DEF_ID};
+use crate::clean::MAX_DEF_ID;
 use crate::config::{Options as RustdocOptions, RenderOptions};
 use crate::config::{OutputFormat, RenderInfo};
-use crate::passes::{self, Condition::*, ConditionalPass};
+use crate::passes;
 
 pub use rustc_session::config::{CodegenOptions, DebuggingOptions, Input, Options};
 pub use rustc_session::search_paths::SearchPath;
@@ -537,8 +536,8 @@ impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for SearchFunctionCall<'tcx> 
 fn run_global_ctxt(
     tcx: TyCtxt<'_>,
     resolver: Rc<RefCell<interface::BoxedResolver>>,
-    mut default_passes: passes::DefaultPassOption,
-    mut manual_passes: Vec<String>,
+    _default_passes: passes::DefaultPassOption,
+    _manual_passes: Vec<String>,
     render_options: RenderOptions,
     output_format: Option<OutputFormat>,
 ) -> (clean::Crate, RenderInfo, RenderOptions) {
@@ -553,59 +552,33 @@ fn run_global_ctxt(
         let _ = body;
     }
 
-    eprintln!("strict digraph {{");
-    for owner in tcx.body_owners() {
-        // dbg!(tcx.item_name(owner.to_def_id()));
-        // dbg!(tcx.def_path(owner.to_def_id()));
-        // let _kind = dbg!(hir.def_kind(owner));
+    tcx.sess.time("build_call_graph", || {
+        eprintln!("strict digraph {{");
+        for owner in tcx.body_owners() {
+            // dbg!(tcx.item_name(owner.to_def_id()));
+            // dbg!(tcx.def_path(owner.to_def_id()));
+            // let _kind = dbg!(hir.def_kind(owner));
 
-        let mir = tcx.mir_built(rustc_middle::ty::WithOptConstParam {
-            did: owner,
-            const_param_did: tcx.opt_const_param_of(owner)
-        });
-        use crate::rustc_middle::mir::visit::Visitor;
-        let mut subfunctions = SearchFunctionCall::new();
-        subfunctions.visit_body(&mir.borrow());
-
-        let caller = tcx.def_path_str(owner.to_def_id());
-        for subfunction in subfunctions.inner_functions {
-            use rustc_middle::mir::Operand;
-            eprintln!("\"{}\" -> \"{}\"", caller, match subfunction {
-                Operand::Constant(ref a) => format!("cst {:?}", a),
-                Operand::Copy(ref place) => format!("copy {:?}", place),
-                Operand::Move(ref place) => format!("move {:?}", place),
+            let mir = tcx.mir_built(rustc_middle::ty::WithOptConstParam {
+                did: owner,
+                const_param_did: tcx.opt_const_param_of(owner)
             });
+            use crate::rustc_middle::mir::visit::Visitor;
+            let mut subfunctions = SearchFunctionCall::new();
+            subfunctions.visit_body(&mir.borrow());
+
+            let caller = tcx.def_path_str(owner.to_def_id());
+            for subfunction in subfunctions.inner_functions {
+                use rustc_middle::mir::Operand;
+                eprintln!("\"{}\" -> \"{}\"", caller, match subfunction {
+                    Operand::Constant(ref a) => format!("cst {:?}", a),
+                    Operand::Copy(ref place) => format!("copy {:?}", place),
+                    Operand::Move(ref place) => format!("move {:?}", place),
+                });
+            }
+            eprintln!();
         }
-        eprintln!();
-    }
-    eprintln!("}}");
-
-    // Certain queries assume that some checks were run elsewhere
-    // (see https://github.com/rust-lang/rust/pull/73566#issuecomment-656954425),
-    // so type-check everything other than function bodies in this crate before running lints.
-
-    // NOTE: this does not call `tcx.analysis()` so that we won't
-    // typeck function bodies or run the default rustc lints.
-    // (see `override_queries` in the `config`)
-
-    // HACK(jynelson) this calls an _extremely_ limited subset of `typeck`
-    // and might break if queries change their assumptions in the future.
-
-    // NOTE: This is copy/pasted from typeck/lib.rs and should be kept in sync with those changes.
-    tcx.sess.time("item_types_checking", || {
-        for &module in tcx.hir().krate().modules.keys() {
-            tcx.ensure().check_mod_item_types(tcx.hir().local_def_id(module));
-        }
-    });
-    tcx.sess.abort_if_errors();
-    tcx.sess.time("missing_docs", || {
-        rustc_lint::check_crate(tcx, rustc_lint::builtin::MissingDoc::new);
-    });
-    tcx.sess.time("check_mod_attrs", || {
-        for &module in tcx.hir().krate().modules.keys() {
-            let local_def_id = tcx.hir().local_def_id(module);
-            tcx.ensure().check_mod_attrs(local_def_id);
-        }
+        eprintln!("}}");
     });
 
     let access_levels = tcx.privacy_access_levels(LOCAL_CRATE);
@@ -647,105 +620,7 @@ fn run_global_ctxt(
     };
     debug!("crate: {:?}", tcx.hir().krate());
 
-    let mut krate = tcx.sess.time("clean_crate", || clean::krate(&mut ctxt));
-
-    if let Some(ref m) = krate.module {
-        if let None | Some("") = m.doc_value() {
-            let help = "The following guide may be of use:\n\
-                https://doc.rust-lang.org/nightly/rustdoc/how-to-write-documentation.html";
-            tcx.struct_lint_node(
-                rustc_lint::builtin::MISSING_CRATE_LEVEL_DOCS,
-                ctxt.as_local_hir_id(m.def_id).unwrap(),
-                |lint| {
-                    let mut diag =
-                        lint.build("no documentation found for this crate's top-level module");
-                    diag.help(help);
-                    diag.emit();
-                },
-            );
-        }
-    }
-
-    fn report_deprecated_attr(name: &str, diag: &rustc_errors::Handler) {
-        let mut msg = diag
-            .struct_warn(&format!("the `#![doc({})]` attribute is considered deprecated", name));
-        msg.warn(
-            "see issue #44136 <https://github.com/rust-lang/rust/issues/44136> \
-             for more information",
-        );
-
-        if name == "no_default_passes" {
-            msg.help("you may want to use `#![doc(document_private_items)]`");
-        }
-
-        msg.emit();
-    }
-
-    // Process all of the crate attributes, extracting plugin metadata along
-    // with the passes which we are supposed to run.
-    for attr in krate.module.as_ref().unwrap().attrs.lists(sym::doc) {
-        let diag = ctxt.sess().diagnostic();
-
-        let name = attr.name_or_empty();
-        if attr.is_word() {
-            if name == sym::no_default_passes {
-                report_deprecated_attr("no_default_passes", diag);
-                if default_passes == passes::DefaultPassOption::Default {
-                    default_passes = passes::DefaultPassOption::None;
-                }
-            }
-        } else if let Some(value) = attr.value_str() {
-            let sink = match name {
-                sym::passes => {
-                    report_deprecated_attr("passes = \"...\"", diag);
-                    &mut manual_passes
-                }
-                sym::plugins => {
-                    report_deprecated_attr("plugins = \"...\"", diag);
-                    eprintln!(
-                        "WARNING: `#![doc(plugins = \"...\")]` \
-                         no longer functions; see CVE-2018-1000622"
-                    );
-                    continue;
-                }
-                _ => continue,
-            };
-            for name in value.as_str().split_whitespace() {
-                sink.push(name.to_string());
-            }
-        }
-
-        if attr.is_word() && name == sym::document_private_items {
-            ctxt.render_options.document_private = true;
-        }
-    }
-
-    let passes = passes::defaults(default_passes).iter().copied().chain(
-        manual_passes.into_iter().flat_map(|name| {
-            if let Some(pass) = passes::find_pass(&name) {
-                Some(ConditionalPass::always(pass))
-            } else {
-                error!("unknown pass {}, skipping", name);
-                None
-            }
-        }),
-    );
-
-    info!("Executing passes");
-
-    for p in passes {
-        let run = match p.condition {
-            Always => true,
-            WhenDocumentPrivate => ctxt.render_options.document_private,
-            WhenNotDocumentPrivate => !ctxt.render_options.document_private,
-            WhenNotDocumentHidden => !ctxt.render_options.document_hidden,
-        };
-        if run {
-            debug!("running pass {}", p.pass.name);
-            krate = ctxt.tcx.sess.time(p.pass.name, || (p.pass.run)(krate, &ctxt));
-        }
-    }
-
+    let krate = tcx.sess.time("clean_crate", || clean::krate(&mut ctxt));
     ctxt.sess().abort_if_errors();
 
     (krate, ctxt.renderinfo.into_inner(), ctxt.render_options)
