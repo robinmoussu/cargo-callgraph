@@ -529,13 +529,30 @@ fn run_global_ctxt(
             subfunctions.visit_body(&mir.borrow());
 
             let caller = tcx.def_path_str(owner.to_def_id());
+            // create function node
+            eprintln!("\"{}\" [shape=none]", caller);
+
             for subfunction in subfunctions.inner_functions {
                 let callee = if let rustc_middle::ty::FnDef(def_id, _) = subfunction.constant().unwrap().literal.ty.kind() {
                     tcx.def_path_str(*def_id)
                 } else {
                     unreachable!();
                 };
-                eprintln!("\"{}\" -> \"{}\"", caller, callee);
+                // create function node
+                eprintln!("\"{}\" [shape=none]", callee);
+
+                let raw_callee = format!("{:?}", subfunction);
+                let monomorphized_call = raw_callee != callee;
+                if monomorphized_call {
+                    // create virtual node for monomorphized call
+                    eprintln!("\"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", raw_callee);
+
+                    eprintln!("\"{}\" -> \"{}\" [arrowhead=none]", caller, raw_callee);
+                    eprintln!("\"{}\" -> \"{}\"", raw_callee, callee);
+                    eprintln!("\"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee, raw_callee);
+                } else {
+                    eprintln!("\"{}\" -> \"{}\"", caller, callee);
+                }
             }
             eprintln!();
         }
