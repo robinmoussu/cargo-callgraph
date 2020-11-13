@@ -518,44 +518,79 @@ fn run_global_ctxt(
     output_format: Option<OutputFormat>,
 ) -> (clean::Crate, RenderInfo, RenderOptions) {
     tcx.sess.time("build_call_graph", || {
-        eprintln!("strict digraph {{");
-        for owner in tcx.body_owners() {
+        #[derive(Clone)]
+        enum Function {
+            Direct(DefId),
+            Monomorphized(DefId, String),
+        }
+
+        use std::collections::HashSet;
+        let mut functions: HashSet<DefId> = HashSet::new();
+        let mut monomorphized_functions: HashSet<String> = HashSet::new();
+        let mut dependencies: Vec<(DefId, Function)> = Vec::new();
+
+        for caller in tcx.body_owners() {
             let mir = tcx.mir_built(rustc_middle::ty::WithOptConstParam {
-                did: owner,
-                const_param_did: tcx.opt_const_param_of(owner)
+                did: caller,
+                const_param_did: tcx.opt_const_param_of(caller)
             });
             use crate::rustc_middle::mir::visit::Visitor;
             let mut subfunctions = SearchFunctionCall::new();
             subfunctions.visit_body(&mir.borrow());
 
-            let caller = tcx.def_path_str(owner.to_def_id());
-            // create function node
-            eprintln!("\"{}\" [shape=none]", caller);
+            let caller = caller.to_def_id();
+            functions.insert(caller);
 
             for subfunction in subfunctions.inner_functions {
-                let callee = if let rustc_middle::ty::FnDef(def_id, _) = subfunction.constant().unwrap().literal.ty.kind() {
-                    tcx.def_path_str(*def_id)
+                let callee_id = if let rustc_middle::ty::FnDef(def_id, _) = subfunction.constant().unwrap().literal.ty.kind() {
+                    *def_id
                 } else {
                     unreachable!();
                 };
-                // create function node
-                eprintln!("\"{}\" [shape=none]", callee);
+                functions.insert(callee_id);
 
-                let raw_callee = format!("{:?}", subfunction);
-                let monomorphized_call = raw_callee != callee;
+                let callee_str = tcx.def_path_str(callee_id);
+                let full_name = format!("{:?}", subfunction);
+                let monomorphized_call = full_name != callee_str;
                 if monomorphized_call {
-                    // create virtual node for monomorphized call
-                    eprintln!("\"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", raw_callee);
-
-                    eprintln!("\"{}\" -> \"{}\" [arrowhead=none]", caller, raw_callee);
-                    eprintln!("\"{}\" -> \"{}\"", raw_callee, callee);
-                    eprintln!("\"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee, raw_callee);
+                    monomorphized_functions.insert(full_name.clone());
+                    dependencies.push((caller, Function::Monomorphized(callee_id, full_name)));
                 } else {
-                    eprintln!("\"{}\" -> \"{}\"", caller, callee);
+                    dependencies.push((caller, Function::Direct(callee_id)));
                 }
             }
-            eprintln!();
         }
+
+        eprintln!("strict digraph {{");
+
+        eprintln!("\n    // create function node");
+        for function in functions {
+            eprintln!("    \"{}\" [shape=none]", tcx.def_path_str(function));
+        }
+
+        eprintln!("\n    // create virtual node for monomorphized call");
+        for full_name in monomorphized_functions {
+            eprintln!("    \"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", full_name);
+        }
+
+        eprintln!("\n    // dependency graph");
+        for (caller, callee) in dependencies {
+            match callee {
+                Function::Direct(callee_id) => {
+                    let caller = tcx.def_path_str(caller);
+                    let callee_str = tcx.def_path_str(callee_id);
+                    eprintln!("    \"{}\" -> \"{}\"", caller, callee_str);
+                },
+                Function::Monomorphized(callee_id, full_name) => {
+                    let caller = tcx.def_path_str(caller);
+                    let callee_str = tcx.def_path_str(callee_id);
+                    eprintln!("    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name);
+                    eprintln!("    \"{}\" -> \"{}\"", full_name, callee_str);
+                    eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name);
+                }
+            }
+        }
+
         eprintln!("}}");
     });
 
