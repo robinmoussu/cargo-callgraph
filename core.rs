@@ -530,7 +530,12 @@ fn run_global_ctxt(
 
             let caller = tcx.def_path_str(owner.to_def_id());
             for subfunction in subfunctions.inner_functions {
-                eprintln!("\"{}\" -> \"{:?}\"", caller, subfunction);
+                let callee = if let rustc_middle::ty::FnDef(def_id, _) = subfunction.constant().unwrap().literal.ty.kind() {
+                    tcx.def_path_str(*def_id)
+                } else {
+                    unreachable!();
+                };
+                eprintln!("\"{}\" -> \"{}\"", caller, callee);
             }
             eprintln!();
         }
