@@ -524,10 +524,20 @@ fn run_global_ctxt(
             Monomorphized(DefId, String),
         }
 
+        use std::collections::HashMap;
         use std::collections::HashSet;
         let mut functions: HashSet<DefId> = HashSet::new();
-        let mut monomorphized_functions: HashSet<String> = HashSet::new();
+        let mut monomorphized_functions: HashSet<(DefId, String)> = HashSet::new();
         let mut dependencies: Vec<(DefId, Function)> = Vec::new();
+
+        fn get_module(tcx: TyCtxt<'_>, function: DefId) -> String {
+            // FIXME: this hacky method is buggy
+            // For example `std::ops::Fn::call` returns `std::ops::Fn` instead of `std::ops`
+            let mut module = tcx.def_path(function);
+            module.data.pop(); // remove the function name for the DefPath
+            use itertools::Itertools;
+            module.data.iter().map(|m| format!("{}", m)).join("::")
+        }
 
         for caller in tcx.body_owners() {
             let mir = tcx.mir_built(rustc_middle::ty::WithOptConstParam {
@@ -542,6 +552,8 @@ fn run_global_ctxt(
             functions.insert(caller);
 
             for subfunction in subfunctions.inner_functions {
+                // TODO: take a look at
+                // https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TyCtxt.html#method.upstream_monomorphizations_for
                 let callee_id = if let rustc_middle::ty::FnDef(def_id, _) = subfunction.constant().unwrap().literal.ty.kind() {
                     *def_id
                 } else {
@@ -553,7 +565,7 @@ fn run_global_ctxt(
                 let full_name = format!("{:?}", subfunction);
                 let monomorphized_call = full_name != callee_str;
                 if monomorphized_call {
-                    monomorphized_functions.insert(full_name.clone());
+                    monomorphized_functions.insert((callee_id, full_name.clone()));
                     dependencies.push((caller, Function::Monomorphized(callee_id, full_name)));
                 } else {
                     dependencies.push((caller, Function::Direct(callee_id)));
@@ -561,16 +573,71 @@ fn run_global_ctxt(
             }
         }
 
+        // Group item by module
+        // TODO: create a hierarchy of module
+        let modules: HashSet<_> = functions
+            .iter()
+            .map(|&f| get_module(tcx, f))
+            .collect();
+        let modules: HashMap<String, usize> = modules
+            .into_iter()
+            .enumerate()
+            .map(|(id, name)| (name, id))
+            .collect();
+
+        let functions = {
+            let mut _functions: HashMap<String, Vec<DefId>> = modules
+                .iter()
+                .map(|(name, _)| (name.clone(), Vec::new()))
+                .collect();
+            for function in functions {
+                _functions.get_mut(&get_module(tcx, function)).unwrap().push(function);
+            }
+            for &(id, _) in &monomorphized_functions {
+                _functions.get_mut(&get_module(tcx, id)).unwrap().push(id);
+            }
+            _functions
+        };
+
+        let monomorphized_functions = {
+            let mut _functions: HashMap<String, Vec<String>> = modules
+                .iter()
+                .map(|(name, _)| (name.clone(), Vec::new()))
+                .collect();
+            for (id, full_name) in monomorphized_functions {
+                _functions.get_mut(&get_module(tcx, id)).unwrap().push(full_name);
+            }
+            _functions
+        };
+
         eprintln!("strict digraph {{");
 
-        eprintln!("\n    // create function node");
-        for function in functions {
-            eprintln!("    \"{}\" [shape=none]", tcx.def_path_str(function));
-        }
+        for (module_name, module_id) in &modules {
+            eprintln!("    subgraph cluster{} {{", module_id);
+            if module_name.is_empty() {
+                // it's the root of the crate
+                let crate_name = "crate_name"; // FIXME
+                eprintln!("        label = <<u>{}</u>>", crate_name);
+                eprintln!("        color = none");
+            } else {
+                // it's a normal module
+                eprintln!("        label = <<u>{}</u>>", module_name);
+                eprintln!("        color = green");
+            }
+            eprintln!("        fontcolor = green");
+            eprintln!();
 
-        eprintln!("\n    // create virtual node for monomorphized call");
-        for full_name in monomorphized_functions {
-            eprintln!("    \"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", full_name);
+            // create function nodes
+            for &function in &functions[module_name] {
+                eprintln!("        \"{}\" [shape=none]", tcx.def_path_str(function));
+            }
+
+            // create virtual nodes for monomorphized call");
+            for full_name in &monomorphized_functions[module_name] {
+                eprintln!("        \"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", full_name);
+            }
+
+            eprintln!("    }}");
         }
 
         eprintln!("\n    // dependency graph");
