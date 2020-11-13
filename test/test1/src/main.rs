@@ -7,7 +7,7 @@ fn main() {
     }
 }
 
-mod m1 {
+pub mod m1 {
     pub fn foo1<F: Fn()>(fct: F) {
         foo2(fct)
     }
@@ -19,7 +19,7 @@ mod m1 {
     }
 }
 
-mod m2 {
+pub mod m2 {
     pub fn bar() {
         baz();
     }

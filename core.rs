@@ -531,12 +531,37 @@ fn run_global_ctxt(
         let mut dependencies: Vec<(DefId, Function)> = Vec::new();
 
         fn get_module(tcx: TyCtxt<'_>, function: DefId) -> String {
-            // FIXME: this hacky method is buggy
-            // For example `std::ops::Fn::call` returns `std::ops::Fn` instead of `std::ops`
-            let mut module = tcx.def_path(function);
-            module.data.pop(); // remove the function name for the DefPath
+            let mut current = function;
+            // The immediate parent might not always be a module.
+            // Find the first parent which is.
+            let module = loop {
+                use crate::rustc_middle::ty::DefIdTree;
+                if let Some(parent) = tcx.parent(current) {
+                    if tcx.def_kind(parent) == rustc_hir::def::DefKind::Mod {
+                        break Some(parent);
+                    }
+                    current = parent;
+                } else {
+                    debug!(
+                        "{:?} has no parent (kind={:?}, original was {:?})",
+                        current,
+                        tcx.def_kind(current),
+                        function
+                    );
+                    break None;
+                }
+            }.unwrap();
+
             use itertools::Itertools;
-            module.data.iter().map(|m| format!("{}", m)).join("::")
+
+            let def_path = tcx.def_path(module);
+            let mut crate_name = tcx.original_crate_name(def_path.krate).to_ident_string();
+            if crate_name == "main" {
+                crate_name = String::new();
+            } else {
+                crate_name += "::";
+            }
+            crate_name + &def_path.data.iter().map(|m| format!("{}", m)).join("::")
         }
 
         for caller in tcx.body_owners() {
