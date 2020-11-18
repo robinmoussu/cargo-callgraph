@@ -15,7 +15,7 @@ use rustc_span::symbol::Ident;
 use rustc_span::with_default_session_globals;
 
 /// Highlights `src`, returning the HTML output.
-pub fn render_with_highlighting(
+crate fn render_with_highlighting(
     src: String,
     class: Option<&str>,
     playground_button: Option<&str>,
@@ -46,7 +46,9 @@ fn write_header(out: &mut String, class: Option<&str>) {
 }
 
 fn write_code(out: &mut String, src: &str) {
-    Classifier::new(src).highlight(&mut |highlight| {
+    // This replace allows to fix how the code source with DOS backline characters is displayed.
+    let src = src.replace("\r\n", "\n");
+    Classifier::new(&src).highlight(&mut |highlight| {
         match highlight {
             Highlight::Token { text, class } => string(out, Escape(text), class),
             Highlight::EnterSpan { class } => enter_span(out, class),
@@ -62,7 +64,6 @@ fn write_footer(out: &mut String, playground_button: Option<&str>) {
 /// How a span of text is classified. Mostly corresponds to token kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Class {
-    None,
     Comment,
     DocComment,
     Attribute,
@@ -87,7 +88,6 @@ impl Class {
     /// Returns the css class expected by rustdoc for each `Class`.
     fn as_html(self) -> &'static str {
         match self {
-            Class::None => "",
             Class::Comment => "comment",
             Class::DocComment => "doccomment",
             Class::Attribute => "attribute",
@@ -110,7 +110,7 @@ impl Class {
 }
 
 enum Highlight<'a> {
-    Token { text: &'a str, class: Class },
+    Token { text: &'a str, class: Option<Class> },
     EnterSpan { class: Class },
     ExitSpan,
 }
@@ -164,8 +164,9 @@ impl<'a> Classifier<'a> {
     /// a couple of following ones as well.
     fn advance(&mut self, token: TokenKind, text: &'a str, sink: &mut dyn FnMut(Highlight<'a>)) {
         let lookahead = self.peek();
+        let no_highlight = |sink: &mut dyn FnMut(_)| sink(Highlight::Token { text, class: None });
         let class = match token {
-            TokenKind::Whitespace => Class::None,
+            TokenKind::Whitespace => return no_highlight(sink),
             TokenKind::LineComment { doc_style } | TokenKind::BlockComment { doc_style, .. } => {
                 if doc_style.is_some() {
                     Class::DocComment
@@ -190,12 +191,12 @@ impl<'a> Classifier<'a> {
             TokenKind::And => match lookahead {
                 Some(TokenKind::And) => {
                     let _and = self.tokens.next();
-                    sink(Highlight::Token { text: "&&", class: Class::Op });
+                    sink(Highlight::Token { text: "&&", class: Some(Class::Op) });
                     return;
                 }
                 Some(TokenKind::Eq) => {
                     let _eq = self.tokens.next();
-                    sink(Highlight::Token { text: "&=", class: Class::Op });
+                    sink(Highlight::Token { text: "&=", class: Some(Class::Op) });
                     return;
                 }
                 Some(TokenKind::Whitespace) => Class::Op,
@@ -226,7 +227,7 @@ impl<'a> Classifier<'a> {
             | TokenKind::At
             | TokenKind::Tilde
             | TokenKind::Colon
-            | TokenKind::Unknown => Class::None,
+            | TokenKind::Unknown => return no_highlight(sink),
 
             TokenKind::Question => Class::QuestionMark,
 
@@ -235,7 +236,7 @@ impl<'a> Classifier<'a> {
                     self.in_macro_nonterminal = true;
                     Class::MacroNonTerminal
                 }
-                _ => Class::None,
+                _ => return no_highlight(sink),
             },
 
             // This might be the start of an attribute. We're going to want to
@@ -251,8 +252,8 @@ impl<'a> Classifier<'a> {
                             self.in_attribute = true;
                             sink(Highlight::EnterSpan { class: Class::Attribute });
                         }
-                        sink(Highlight::Token { text: "#", class: Class::None });
-                        sink(Highlight::Token { text: "!", class: Class::None });
+                        sink(Highlight::Token { text: "#", class: None });
+                        sink(Highlight::Token { text: "!", class: None });
                         return;
                     }
                     // Case 2: #[outer_attribute]
@@ -262,16 +263,16 @@ impl<'a> Classifier<'a> {
                     }
                     _ => (),
                 }
-                Class::None
+                return no_highlight(sink);
             }
             TokenKind::CloseBracket => {
                 if self.in_attribute {
                     self.in_attribute = false;
-                    sink(Highlight::Token { text: "]", class: Class::None });
+                    sink(Highlight::Token { text: "]", class: None });
                     sink(Highlight::ExitSpan);
                     return;
                 }
-                Class::None
+                return no_highlight(sink);
             }
             TokenKind::Literal { kind, .. } => match kind {
                 // Text literals.
@@ -307,7 +308,7 @@ impl<'a> Classifier<'a> {
         };
         // Anything that didn't return above is the simple case where we the
         // class just spans a single token, so we can use the `string` method.
-        sink(Highlight::Token { text, class });
+        sink(Highlight::Token { text, class: Some(class) });
     }
 
     fn peek(&mut self) -> Option<TokenKind> {
@@ -337,10 +338,10 @@ fn exit_span(out: &mut String) {
 /// ```
 /// The latter can be thought of as a shorthand for the former, which is more
 /// flexible.
-fn string<T: Display>(out: &mut String, text: T, klass: Class) {
+fn string<T: Display>(out: &mut String, text: T, klass: Option<Class>) {
     match klass {
-        Class::None => write!(out, "{}", text).unwrap(),
-        klass => write!(out, "<span class=\"{}\">{}</span>", klass.as_html(), text).unwrap(),
+        None => write!(out, "{}", text).unwrap(),
+        Some(klass) => write!(out, "<span class=\"{}\">{}</span>", klass.as_html(), text).unwrap(),
     }
 }
 

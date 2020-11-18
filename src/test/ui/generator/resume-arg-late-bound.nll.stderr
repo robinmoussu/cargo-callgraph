@@ -1,8 +1,0 @@
-error: higher-ranked subtype error
-  --> $DIR/resume-arg-late-bound.rs:15:5
-   |
-LL |     test(gen);
-   |     ^^^^^^^^^
-
-error: aborting due to previous error
-

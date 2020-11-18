@@ -14,7 +14,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::ops;
 
-pub const CALCULATE_DOC_COVERAGE: Pass = Pass {
+crate const CALCULATE_DOC_COVERAGE: Pass = Pass {
     name: "calculate-doc-coverage",
     run: calculate_doc_coverage,
     description: "counts the number of items with and without documentation",
@@ -187,7 +187,7 @@ impl<'a, 'b> CoverageCalculator<'a, 'b> {
 
 impl<'a, 'b> fold::DocFolder for CoverageCalculator<'a, 'b> {
     fn fold_item(&mut self, i: clean::Item) -> Option<clean::Item> {
-        match i.inner {
+        match i.kind {
             _ if !i.def_id.is_local() => {
                 // non-local items are skipped because they can be out of the users control,
                 // especially in the case of trait impls, which rustdoc eagerly inlines

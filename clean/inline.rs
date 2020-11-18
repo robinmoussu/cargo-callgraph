@@ -54,7 +54,7 @@ crate fn try_inline(
     debug!("attrs={:?}", attrs);
     let attrs_clone = attrs;
 
-    let inner = match res {
+    let kind = match res {
         Res::Def(DefKind::Trait, did) => {
             record_extern_fqn(cx, did, clean::TypeKind::Trait);
             ret.extend(build_impls(cx, Some(parent_module), did, attrs));
@@ -124,16 +124,8 @@ crate fn try_inline(
     let attrs = merge_attrs(cx, Some(parent_module), target_attrs, attrs_clone);
 
     cx.renderinfo.borrow_mut().inlined.insert(did);
-    ret.push(clean::Item {
-        source: cx.tcx.def_span(did).clean(cx),
-        name: Some(name.clean(cx)),
-        attrs,
-        inner,
-        visibility: clean::Public,
-        stability: cx.tcx.lookup_stability(did).cloned(),
-        deprecation: cx.tcx.lookup_deprecation(did).clean(cx),
-        def_id: did,
-    });
+    let what_rustc_thinks = clean::Item::from_def_id_and_parts(did, Some(name), kind, cx);
+    ret.push(clean::Item { attrs, ..what_rustc_thinks });
     Some(ret)
 }
 
@@ -193,7 +185,6 @@ crate fn build_external_trait(cx: &DocContext<'_>, did: DefId) -> clean::Trait {
     let trait_items =
         cx.tcx.associated_items(did).in_definition_order().map(|item| item.clean(cx)).collect();
 
-    let auto_trait = cx.tcx.trait_def(did).has_auto_impl;
     let predicates = cx.tcx.predicates_of(did);
     let generics = (cx.tcx.generics_of(did), predicates).clean(cx);
     let generics = filter_non_trait_generics(did, generics);
@@ -201,7 +192,6 @@ crate fn build_external_trait(cx: &DocContext<'_>, did: DefId) -> clean::Trait {
     let is_spotlight = load_attrs(cx, did).clean(cx).has_doc_flag(sym::spotlight);
     let is_auto = cx.tcx.trait_is_auto(did);
     clean::Trait {
-        auto: auto_trait,
         unsafety: cx.tcx.trait_def(did).unsafety,
         generics,
         items: trait_items,
@@ -445,8 +435,10 @@ crate fn build_impl(
 
     debug!("build_impl: impl {:?} for {:?}", trait_.def_id(), for_.def_id());
 
-    ret.push(clean::Item {
-        inner: clean::ImplItem(clean::Impl {
+    ret.push(clean::Item::from_def_id_and_parts(
+        did,
+        None,
+        clean::ImplItem(clean::Impl {
             unsafety: hir::Unsafety::Normal,
             generics,
             provided_trait_methods: provided,
@@ -457,14 +449,8 @@ crate fn build_impl(
             synthetic: false,
             blanket_impl: None,
         }),
-        source: tcx.def_span(did).clean(cx),
-        name: None,
-        attrs,
-        visibility: clean::Inherited,
-        stability: tcx.lookup_stability(did).cloned(),
-        deprecation: tcx.lookup_deprecation(did).clean(cx),
-        def_id: did,
-    });
+        cx,
+    ));
 }
 
 fn build_module(cx: &DocContext<'_>, did: DefId, visited: &mut FxHashSet<DefId>) -> clean::Module {
@@ -498,7 +484,7 @@ fn build_module(cx: &DocContext<'_>, did: DefId, visited: &mut FxHashSet<DefId>)
                         visibility: clean::Public,
                         stability: None,
                         deprecation: None,
-                        inner: clean::ImportItem(clean::Import::new_simple(
+                        kind: clean::ImportItem(clean::Import::new_simple(
                             item.ident.to_string(),
                             clean::ImportSource {
                                 path: clean::Path {
@@ -555,7 +541,7 @@ fn build_static(cx: &DocContext<'_>, did: DefId, mutable: bool) -> clean::Static
     }
 }
 
-fn build_macro(cx: &DocContext<'_>, did: DefId, name: Symbol) -> clean::ItemEnum {
+fn build_macro(cx: &DocContext<'_>, did: DefId, name: Symbol) -> clean::ItemKind {
     let imported_from = cx.tcx.original_crate_name(did.krate);
     match cx.enter_resolver(|r| r.cstore().load_macro_untracked(did, cx.sess())) {
         LoadedMacro::MacroDef(def, _) => {

@@ -4,13 +4,12 @@ use crate::core::DocContext;
 use crate::fold::DocFolder;
 use crate::html::markdown::opts;
 use core::ops::Range;
-use pulldown_cmark::{Event, Parser};
-use rustc_feature::UnstableFeatures;
+use pulldown_cmark::{Event, Parser, Tag};
 use rustc_session::lint;
 use std::iter::Peekable;
 use std::str::CharIndices;
 
-pub const CHECK_INVALID_HTML_TAGS: Pass = Pass {
+crate const CHECK_INVALID_HTML_TAGS: Pass = Pass {
     name: "check-invalid-html-tags",
     run: check_invalid_html_tags,
     description: "detects invalid HTML tags in doc comments",
@@ -26,8 +25,8 @@ impl<'a, 'tcx> InvalidHtmlTagsLinter<'a, 'tcx> {
     }
 }
 
-pub fn check_invalid_html_tags(krate: Crate, cx: &DocContext<'_>) -> Crate {
-    if !UnstableFeatures::from_environment().is_nightly_build() {
+crate fn check_invalid_html_tags(krate: Crate, cx: &DocContext<'_>) -> Crate {
+    if !cx.tcx.sess.is_nightly_build() {
         krate
     } else {
         let mut coll = InvalidHtmlTagsLinter::new(cx);
@@ -197,14 +196,17 @@ impl<'a, 'tcx> DocFolder for InvalidHtmlTagsLinter<'a, 'tcx> {
 
             let mut tags = Vec::new();
             let mut is_in_comment = None;
+            let mut in_code_block = false;
 
             let p = Parser::new_ext(&dox, opts()).into_offset_iter();
 
             for (event, range) in p {
                 match event {
-                    Event::Html(text) | Event::Text(text) => {
+                    Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+                    Event::Html(text) | Event::Text(text) if !in_code_block => {
                         extract_tags(&mut tags, &text, range, &mut is_in_comment, &report_diag)
                     }
+                    Event::End(Tag::CodeBlock(_)) => in_code_block = false,
                     _ => {}
                 }
             }

@@ -12,7 +12,7 @@ use crate::html::markdown::{find_testable_code, ErrorCodes, Ignore, LangString};
 use rustc_middle::lint::LintSource;
 use rustc_session::lint;
 
-pub const CHECK_PRIVATE_ITEMS_DOC_TESTS: Pass = Pass {
+crate const CHECK_PRIVATE_ITEMS_DOC_TESTS: Pass = Pass {
     name: "check-private-items-doc-tests",
     run: check_private_items_doc_tests,
     description: "check private items doc tests",
@@ -28,7 +28,7 @@ impl<'a, 'tcx> PrivateItemDocTestLinter<'a, 'tcx> {
     }
 }
 
-pub fn check_private_items_doc_tests(krate: Crate, cx: &DocContext<'_>) -> Crate {
+crate fn check_private_items_doc_tests(krate: Crate, cx: &DocContext<'_>) -> Crate {
     let mut coll = PrivateItemDocTestLinter::new(cx);
 
     coll.fold_crate(krate)
@@ -57,8 +57,8 @@ impl crate::doctest::Tester for Tests {
     }
 }
 
-pub fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -> bool {
-    if matches!(item.inner,
+crate fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -> bool {
+    if matches!(item.kind,
         clean::StructFieldItem(_)
         | clean::VariantItem(_)
         | clean::AssocConstItem(_, _)
@@ -79,7 +79,7 @@ pub fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -> bool 
     level != lint::Level::Allow || matches!(source, LintSource::Default)
 }
 
-pub fn look_for_tests<'tcx>(cx: &DocContext<'tcx>, dox: &str, item: &Item) {
+crate fn look_for_tests<'tcx>(cx: &DocContext<'tcx>, dox: &str, item: &Item) {
     let hir_id = match cx.as_local_hir_id(item.def_id) {
         Some(hir_id) => hir_id,
         None => {
@@ -92,9 +92,7 @@ pub fn look_for_tests<'tcx>(cx: &DocContext<'tcx>, dox: &str, item: &Item) {
 
     find_testable_code(&dox, &mut tests, ErrorCodes::No, false, None);
 
-    if tests.found_tests == 0
-        && rustc_feature::UnstableFeatures::from_environment().is_nightly_build()
-    {
+    if tests.found_tests == 0 && cx.tcx.sess.is_nightly_build() {
         if should_have_doc_example(cx, &item) {
             debug!("reporting error for {:?} (hir_id={:?})", item, hir_id);
             let sp = span_of_attrs(&item.attrs).unwrap_or(item.source.span());
