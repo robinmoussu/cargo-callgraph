@@ -1,5 +1,5 @@
 use crate::rustc_middle::mir::visit::Visitor;
-use crate::rustc_middle::ty::DefIdTree;
+use crate::rustc_middle::ty::{DefIdTree, Ty};
 use itertools::Itertools;
 use rustc_hir::def_id::DefId;
 use rustc_index::vec::IndexVec;
@@ -8,6 +8,172 @@ use rustc_middle::mir::terminator::*;
 use rustc_middle::ty::TyCtxt;
 use std::collections::HashMap;
 use std::collections::HashSet;
+
+// ************************************************************ //
+// The output of the analysis
+
+type LocalCallee = usize;
+
+/// Store all the dependencies between one function and its callee
+pub struct FunctionDependencies<'tcx> {
+    /// name of the function
+    name: mir::Constant<'tcx>,
+    /// name and type of all the arguments and the returned value to this
+    /// function
+    arguments: IndexVec<mir::Local, (Option<mir::Constant<'tcx>>, Ty<'tcx>)>,
+    /// List of all call-sites inside the body of this function
+    callee: IndexVec<LocalCallee, Callee<'tcx>>,
+}
+
+/// Store the name of a called function and the source of all of its arguments
+pub struct Callee<'tcx> {
+    /// name of the called function
+    name: mir::Constant<'tcx>,
+    /// source (possibly over-approximated) of the source of each argument to
+    /// this called function
+    arguments: IndexVec<mir::Local, HashSet<Origin<'tcx>>>,
+}
+
+/// Express one of the possible source of a given argument
+pub enum Origin<'tcx> {
+    /// A literal expression
+    Literal(mir::Constant<'tcx>),
+    /// An argument of the function being analyzed
+    FromArgument(mir::Local),
+    /// The return value of a another callee
+    FromReturn(LocalCallee),
+}
+
+// ************************************************************ //
+// Extract relationship between all the locals in a function
+
+// FIXME: -> IndexVec<mir::Local, Vec<mir::Local>>
+fn depends_from_args(mir: &mir::Body) -> IndexVec<mir::Local, bool> {
+    // TODO: extract the relationship between the local_variable and the argument to the
+    // function, an not just the boolean information that it cames from an argument
+
+    // +1 because of the return value
+    let local_count = mir.arg_count + mir.local_decls.len() + 1;
+
+    let mut dependencies: IndexVec<mir::Local, Vec<mir::Local>> = (0..local_count)
+        .map(|_| Vec::new())
+        .collect();
+    for basic_block in mir.basic_blocks() {
+        for statement in &basic_block.statements {
+
+            let ignore = || {};
+            let mut add_dependency = |lvalue: mir::Local, rvalue: mir::Place<'_>| {
+                if let Some(rvalue) = rvalue.local_or_deref_local() {
+                    dependencies[lvalue].push(rvalue);
+                }
+            };
+
+            match &statement.kind {
+                mir::StatementKind::Assign(assignment) => {
+                    let (lvalue, rvalue) = &**assignment;
+                    let lvalue = lvalue.as_local().unwrap();
+
+                    match rvalue {
+                        mir::Rvalue::Use(op) => {
+                            op.place().map(|rvalue| add_dependency(lvalue, rvalue));
+                        },
+                        mir::Rvalue::Repeat(op, _) => {
+                            op.place().map(|rvalue| add_dependency(lvalue, rvalue));
+                        },
+                        mir::Rvalue::Ref(_, _, rvalue) => {
+                            add_dependency(lvalue, *rvalue);
+                        },
+                        mir::Rvalue::ThreadLocalRef(_) => {
+                            () // TODO:add support to threadlocal;
+                        },
+                        mir::Rvalue::AddressOf(_, rvalue) => {
+                            add_dependency(lvalue, *rvalue);
+                        },
+                        mir::Rvalue::Len(_) => {
+                            ignore();
+                        },
+                        mir::Rvalue::Cast(_, op, _) => {
+                            op.place().map(|rvalue| add_dependency(lvalue, rvalue));
+                        },
+                        mir::Rvalue::BinaryOp(_, op1, op2) => {
+                            op1.place().map(|rvalue| add_dependency(lvalue, rvalue));
+                            op2.place().map(|rvalue| add_dependency(lvalue, rvalue));
+                        },
+                        mir::Rvalue::CheckedBinaryOp(_, op1, op2) => {
+                            op1.place().map(|rvalue| add_dependency(lvalue, rvalue));
+                            op2.place().map(|rvalue| add_dependency(lvalue, rvalue));
+                        },
+                        mir::Rvalue::NullaryOp(_, _) => {
+                            ignore();
+                        },
+                        mir::Rvalue::UnaryOp(_, op) => {
+                            op.place().map(|rvalue| add_dependency(lvalue, rvalue));
+                        },
+                        mir::Rvalue::Discriminant(_) => {
+                            ignore();
+                        },
+                        mir::Rvalue::Aggregate(_, operands) => {
+                            for op in operands {
+                                op.place().map(|rvalue| add_dependency(lvalue, rvalue));
+                            }
+                        },
+                    }
+                },
+                mir::StatementKind::LlvmInlineAsm(assembly) => {
+                    let rustc_middle::mir::LlvmInlineAsm{asm: _, outputs, inputs} = &**assembly;
+                    let inputs = &**inputs;
+                    let outputs = &**outputs;
+                    for (_, lvalue) in inputs {
+                        if let Some(lvalue) = lvalue.place() {
+                            let lvalue = lvalue.as_local().unwrap();
+                            for rvalue in outputs {
+                                add_dependency(lvalue, *rvalue);
+                            }
+                        }
+                    }
+                },
+                mir::StatementKind::FakeRead(..) 
+                | mir::StatementKind::SetDiscriminant {..} 
+                | mir::StatementKind::StorageLive(..) 
+                | mir::StatementKind::StorageDead(..) 
+                | mir::StatementKind::Retag(..) 
+                | mir::StatementKind::AscribeUserType(..) 
+                | mir::StatementKind::Coverage(..) 
+                | mir::StatementKind::Nop => {
+                    ignore();
+                },
+            }
+        }
+    }
+
+    let mut depends_from_args: IndexVec<mir::Local, Option<bool>> = (0..local_count)
+        .map(|_| None)
+        .collect();
+    for arg in mir.args_iter() {
+        depends_from_args[arg] = Some(true);
+    }
+    while !depends_from_args.iter().all(Option::is_some) {
+        for (lvalue, dependencies) in dependencies.iter_enumerated() {
+            if depends_from_args[lvalue] == None {
+                if dependencies.iter().any(|rvalue| depends_from_args[*rvalue] == Some(true)) {
+                    depends_from_args[lvalue] = Some(true);
+                } else if dependencies.iter().all(|rvalue| depends_from_args[*rvalue] == Some(false)) {
+                    // Note: In case dependencies is empty, the condition is also true
+                    // No dependencies => it's a constant
+                    depends_from_args[lvalue] = Some(false);
+                }
+            }
+        }
+    }
+    let depends_from_args: IndexVec<mir::Local, bool> = depends_from_args
+        .iter()
+        .map(|has_dependency| has_dependency == &Some(true))
+        .collect();
+    depends_from_args
+}
+
+// ************************************************************ //
+// Extracting the informations about all function call
 
 struct SearchFunctionCall<'tcx, 'dependencies> {
     inner_functions: Vec<(mir::Operand<'tcx>, bool)>,
@@ -43,6 +209,10 @@ impl<'tcx, 'dependencies> rustc_middle::mir::visit::Visitor<'tcx> for SearchFunc
     }
 }
 
+// ************************************************************ //
+// Utilities
+
+/// Return the name of the module of a given function
 fn get_module(tcx: TyCtxt<'_>, function: DefId) -> String {
     let mut current = function;
     // The immediate parent might not always be a module.
@@ -93,129 +263,7 @@ pub fn extract_dependencies(tcx: TyCtxt<'_>) {
         });
         let mir = &mir.borrow();
 
-        let depends_from_args = {
-            // TODO: extract the relationship between the local_variable and the argument to the
-            // function, an not just the boolean information that it cames from an argument
-
-            // +1 because of the return value
-            let local_count = mir.arg_count + mir.local_decls.len() + 1;
-
-            let mut dependencies: IndexVec<mir::Local, Vec<mir::Local>> = (0..local_count)
-                .map(|_| Vec::new())
-                .collect();
-            for basic_block in mir.basic_blocks() {
-                for statement in &basic_block.statements {
-
-                    let ignore = || {};
-                    let mut add_dependency = |lvalue: mir::Local, rvalue: mir::Place<'_>| {
-                        if let Some(rvalue) = rvalue.local_or_deref_local() {
-                            dependencies[lvalue].push(rvalue);
-                        }
-                    };
-
-                    match &statement.kind {
-                        mir::StatementKind::Assign(assignment) => {
-                            let (lvalue, rvalue) = &**assignment;
-                            let lvalue = lvalue.as_local().unwrap();
-
-                            match rvalue {
-                                mir::Rvalue::Use(op) => {
-                                    op.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                                },
-                                mir::Rvalue::Repeat(op, _) => {
-                                    op.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                                },
-                                mir::Rvalue::Ref(_, _, rvalue) => {
-                                    add_dependency(lvalue, *rvalue);
-                                },
-                                mir::Rvalue::ThreadLocalRef(_) => {
-                                    () // TODO:add support to threadlocal;
-                                },
-                                mir::Rvalue::AddressOf(_, rvalue) => {
-                                    add_dependency(lvalue, *rvalue);
-                                },
-                                mir::Rvalue::Len(_) => {
-                                    ignore();
-                                },
-                                mir::Rvalue::Cast(_, op, _) => {
-                                    op.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                                },
-                                mir::Rvalue::BinaryOp(_, op1, op2) => {
-                                    op1.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                                    op2.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                                },
-                                mir::Rvalue::CheckedBinaryOp(_, op1, op2) => {
-                                    op1.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                                    op2.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                                },
-                                mir::Rvalue::NullaryOp(_, _) => {
-                                    ignore();
-                                },
-                                mir::Rvalue::UnaryOp(_, op) => {
-                                    op.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                                },
-                                mir::Rvalue::Discriminant(_) => {
-                                    ignore();
-                                },
-                                mir::Rvalue::Aggregate(_, operands) => {
-                                    for op in operands {
-                                        op.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                                    }
-                                },
-                            }
-                        },
-                        mir::StatementKind::LlvmInlineAsm(assembly) => {
-                            let rustc_middle::mir::LlvmInlineAsm{asm: _, outputs, inputs} = &**assembly;
-                            let inputs = &**inputs;
-                            let outputs = &**outputs;
-                            for (_, lvalue) in inputs {
-                                if let Some(lvalue) = lvalue.place() {
-                                    let lvalue = lvalue.as_local().unwrap();
-                                    for rvalue in outputs {
-                                        add_dependency(lvalue, *rvalue);
-                                    }
-                                }
-                            }
-                        },
-                        mir::StatementKind::FakeRead(..) 
-                        | mir::StatementKind::SetDiscriminant {..} 
-                        | mir::StatementKind::StorageLive(..) 
-                        | mir::StatementKind::StorageDead(..) 
-                        | mir::StatementKind::Retag(..) 
-                        | mir::StatementKind::AscribeUserType(..) 
-                        | mir::StatementKind::Coverage(..) 
-                        | mir::StatementKind::Nop => {
-                            ignore();
-                        },
-                    }
-                }
-            }
-
-            let mut depends_from_args: IndexVec<mir::Local, Option<bool>> = (0..local_count)
-                .map(|_| None)
-                .collect();
-            for arg in mir.args_iter() {
-                depends_from_args[arg] = Some(true);
-            }
-            while !depends_from_args.iter().all(Option::is_some) {
-                for (lvalue, dependencies) in dependencies.iter_enumerated() {
-                    if depends_from_args[lvalue] == None {
-                        if dependencies.iter().any(|rvalue| depends_from_args[*rvalue] == Some(true)) {
-                            depends_from_args[lvalue] = Some(true);
-                        } else if dependencies.iter().all(|rvalue| depends_from_args[*rvalue] == Some(false)) {
-                            // Note: In case dependencies is empty, the condition is also true
-                            // No dependencies => it's a constant
-                            depends_from_args[lvalue] = Some(false);
-                        }
-                    }
-                }
-            }
-            let depends_from_args: IndexVec<mir::Local, bool> = depends_from_args
-                .iter()
-                .map(|has_dependency| has_dependency == &Some(true))
-                .collect();
-            depends_from_args
-        };
+        let depends_from_args = depends_from_args(&mir);
 
         let mut subfunctions = SearchFunctionCall::new(&depends_from_args);
         subfunctions.visit_body(mir);
