@@ -18,12 +18,12 @@ use rustc_middle::middle::cstore::CrateStore;
 use rustc_middle::middle::privacy::AccessLevels;
 use rustc_middle::ty::{Ty, TyCtxt};
 use rustc_resolve as resolve;
-use rustc_session::config::{self, CrateType, ErrorOutputType};
-use rustc_session::lint;
 use rustc_session::DiagnosticOutput;
 use rustc_session::Session;
-use rustc_span::source_map;
+use rustc_session::config::{self, CrateType, ErrorOutputType};
+use rustc_session::lint;
 use rustc_span::DUMMY_SP;
+use rustc_span::source_map;
 
 use std::cell::RefCell;
 use std::mem;
@@ -34,6 +34,7 @@ use crate::clean::MAX_DEF_ID;
 use crate::config::{Options as RustdocOptions, RenderOptions};
 use crate::config::{OutputFormat, RenderInfo};
 use crate::passes;
+use crate::extract_dependencies::extract_dependencies;
 
 pub use rustc_session::config::{CodegenOptions, DebuggingOptions, Input, Options};
 pub use rustc_session::search_paths::SearchPath;
@@ -486,29 +487,6 @@ pub fn run_core(
     })
 }
 
-struct SearchFunctionCall<'tcx> {
-    inner_functions: Vec<rustc_middle::mir::Operand<'tcx>>,
-}
-
-impl<'tcx> SearchFunctionCall<'tcx> {
-    fn new() -> Self {
-        SearchFunctionCall {
-            inner_functions: Vec::new(),
-        }
-    }
-}
-
-use rustc_middle::mir::terminator::*;
-use rustc_middle::mir::Location;
-impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for SearchFunctionCall<'tcx> {
-    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, _location: Location) {
-        if let TerminatorKind::Call{func, ..} = &terminator.kind {
-            // dbg!(func, args, destination, cleanup, from_hir_call, fn_span);
-            self.inner_functions.push(func.clone());
-        }
-    }
-}
-
 fn run_global_ctxt(
     tcx: TyCtxt<'_>,
     resolver: Rc<RefCell<interface::BoxedResolver>>,
@@ -518,173 +496,9 @@ fn run_global_ctxt(
     output_format: Option<OutputFormat>,
 ) -> (clean::Crate, RenderInfo, RenderOptions) {
     tcx.sess.time("build_call_graph", || {
-        #[derive(Clone)]
-        enum Function {
-            Direct(DefId),
-            Monomorphized(DefId, String),
-        }
-
-        use std::collections::HashMap;
-        use std::collections::HashSet;
-        let mut functions: HashSet<DefId> = HashSet::new();
-        let mut monomorphized_functions: HashSet<(DefId, String)> = HashSet::new();
-        let mut dependencies: Vec<(DefId, Function)> = Vec::new();
-
-        fn get_module(tcx: TyCtxt<'_>, function: DefId) -> String {
-            let mut current = function;
-            // The immediate parent might not always be a module.
-            // Find the first parent which is.
-            let module = loop {
-                use crate::rustc_middle::ty::DefIdTree;
-                if let Some(parent) = tcx.parent(current) {
-                    if tcx.def_kind(parent) == rustc_hir::def::DefKind::Mod {
-                        break Some(parent);
-                    }
-                    current = parent;
-                } else {
-                    debug!(
-                        "{:?} has no parent (kind={:?}, original was {:?})",
-                        current,
-                        tcx.def_kind(current),
-                        function
-                    );
-                    break None;
-                }
-            }.unwrap();
-
-            use itertools::Itertools;
-
-            let def_path = tcx.def_path(module);
-            let mut crate_name = tcx.original_crate_name(def_path.krate).to_ident_string();
-            if crate_name == "main" {
-                crate_name = String::new();
-            } else {
-                crate_name += "::";
-            }
-            crate_name + &def_path.data.iter().map(|m| format!("{}", m)).join("::")
-        }
-
-        for caller in tcx.body_owners() {
-            let mir = tcx.mir_built(rustc_middle::ty::WithOptConstParam {
-                did: caller,
-                const_param_did: tcx.opt_const_param_of(caller)
-            });
-            use crate::rustc_middle::mir::visit::Visitor;
-            let mut subfunctions = SearchFunctionCall::new();
-            subfunctions.visit_body(&mir.borrow());
-
-            let caller = caller.to_def_id();
-            functions.insert(caller);
-
-            for subfunction in subfunctions.inner_functions {
-                // TODO: take a look at
-                // https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TyCtxt.html#method.upstream_monomorphizations_for
-                let callee_id = if let rustc_middle::ty::FnDef(def_id, _) = subfunction.constant().unwrap().literal.ty.kind() {
-                    *def_id
-                } else {
-                    unreachable!();
-                };
-                functions.insert(callee_id);
-
-                let callee_str = tcx.def_path_str(callee_id);
-                let full_name = format!("{:?}", subfunction);
-                let monomorphized_call = full_name != callee_str;
-                if monomorphized_call {
-                    monomorphized_functions.insert((callee_id, full_name.clone()));
-                    dependencies.push((caller, Function::Monomorphized(callee_id, full_name)));
-                } else {
-                    dependencies.push((caller, Function::Direct(callee_id)));
-                }
-            }
-        }
-
-        // Group item by module
-        // TODO: create a hierarchy of module
-        let modules: HashSet<_> = functions
-            .iter()
-            .map(|&f| get_module(tcx, f))
-            .collect();
-        let modules: HashMap<String, usize> = modules
-            .into_iter()
-            .enumerate()
-            .map(|(id, name)| (name, id))
-            .collect();
-
-        let functions = {
-            let mut _functions: HashMap<String, Vec<DefId>> = modules
-                .iter()
-                .map(|(name, _)| (name.clone(), Vec::new()))
-                .collect();
-            for function in functions {
-                _functions.get_mut(&get_module(tcx, function)).unwrap().push(function);
-            }
-            for &(id, _) in &monomorphized_functions {
-                _functions.get_mut(&get_module(tcx, id)).unwrap().push(id);
-            }
-            _functions
-        };
-
-        let monomorphized_functions = {
-            let mut _functions: HashMap<String, Vec<String>> = modules
-                .iter()
-                .map(|(name, _)| (name.clone(), Vec::new()))
-                .collect();
-            for (id, full_name) in monomorphized_functions {
-                _functions.get_mut(&get_module(tcx, id)).unwrap().push(full_name);
-            }
-            _functions
-        };
-
-        eprintln!("strict digraph {{");
-
-        for (module_name, module_id) in &modules {
-            eprintln!("    subgraph cluster{} {{", module_id);
-            if module_name.is_empty() {
-                // it's the root of the crate
-                let crate_name = "crate_name"; // FIXME
-                eprintln!("        label = <<u>{}</u>>", crate_name);
-                eprintln!("        color = none");
-            } else {
-                // it's a normal module
-                eprintln!("        label = <<u>{}</u>>", module_name);
-                eprintln!("        color = green");
-            }
-            eprintln!("        fontcolor = green");
-            eprintln!();
-
-            // create function nodes
-            for &function in &functions[module_name] {
-                eprintln!("        \"{}\" [shape=none]", tcx.def_path_str(function));
-            }
-
-            // create virtual nodes for monomorphized call");
-            for full_name in &monomorphized_functions[module_name] {
-                eprintln!("        \"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", full_name);
-            }
-
-            eprintln!("    }}");
-        }
-
-        eprintln!("\n    // dependency graph");
-        for (caller, callee) in dependencies {
-            match callee {
-                Function::Direct(callee_id) => {
-                    let caller = tcx.def_path_str(caller);
-                    let callee_str = tcx.def_path_str(callee_id);
-                    eprintln!("    \"{}\" -> \"{}\"", caller, callee_str);
-                },
-                Function::Monomorphized(callee_id, full_name) => {
-                    let caller = tcx.def_path_str(caller);
-                    let callee_str = tcx.def_path_str(callee_id);
-                    eprintln!("    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name);
-                    eprintln!("    \"{}\" -> \"{}\"", full_name, callee_str);
-                    eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name);
-                }
-            }
-        }
-
-        eprintln!("}}");
+        extract_dependencies(tcx);
     });
+
 
     let access_levels = tcx.privacy_access_levels(LOCAL_CRATE);
     // Convert from a HirId set to a DefId set since we don't always have easy access

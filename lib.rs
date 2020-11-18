@@ -74,6 +74,7 @@ mod docfs;
 mod doctree;
 #[macro_use]
 mod error;
+mod extract_dependencies;
 mod doctest;
 mod fold;
 crate mod formats;
