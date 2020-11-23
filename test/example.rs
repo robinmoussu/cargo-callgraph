@@ -1,5 +1,7 @@
 #![feature(fn_traits)]
 
+// TODO: add multi-level struct
+
 fn foo() {}
 fn get_foo_impl() -> impl Fn() {
     foo
@@ -42,13 +44,19 @@ pub fn direct_call() {
 }
 
 pub fn call_from_local() {
-    let fct /*:impl Fn() */ = foo;
+    let fct = foo;
     fct()
 }
 
 pub fn call_from_local_lambda() {
-    let fct /*:impl Fn() */ = || foo();
+    let fct = || foo();
     fct()
+}
+
+pub fn call_from_local_inline_lambda() {
+    (|| {
+        foo()
+    })()
 }
 
 pub fn call_from_argument_generic<Fct: Fn()>(fct: Fct) {
@@ -74,6 +82,10 @@ pub fn call_from_custom_trait(fct: &dyn WrapperTrait) {
 pub fn call_from_return_of_other_function() {
     let fct = get_foo_impl();
     fct()
+}
+
+pub fn call_from_inline_return_of_other_function() {
+    get_foo_impl()()
 }
 
 pub fn call_from_wrapper_1(fct: WrapperStruct<impl Fn()>) {
@@ -105,8 +117,12 @@ pub fn call_trait_with_associated_type(get_fct: impl WrapperTraitWithAssociatedT
     fct()
 }
 
+pub fn call_trait_with_associated_type_inline(get_fct: impl WrapperTraitWithAssociatedType) {
+    get_fct.get_fct()()
+}
+
 pub fn call_from_multiple_local(random: bool) {
-    let fct /*:impl Fn() */ = if random {
+    let fct = if random {
         foo
     } else {
         bar
@@ -195,7 +211,7 @@ pub fn call_mixed_source<
 {
     let fct: Box<dyn Fn()> = match random {
         0 => Box::new(foo),
-        1 => Box::new(|| bar()),
+        // 1 => Box::new(|| bar()),
         2 => Box::new(get_foo_impl()),
         3 => Box::new(get_bar_ptr()),
 

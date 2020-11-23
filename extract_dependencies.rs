@@ -1,13 +1,15 @@
-use crate::rustc_middle::mir::visit::Visitor;
-use crate::rustc_middle::ty::{DefIdTree, Ty};
+use bit_vec::BitVec;
 use itertools::Itertools;
 use rustc_hir::def_id::DefId;
 use rustc_index::vec::IndexVec;
-use rustc_middle::mir;
 use rustc_middle::mir::terminator::*;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::mir;
+use rustc_middle::ty;
+use rustc_span::symbol::Symbol;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::default::default;
+use std::fmt;
 
 // ************************************************************ //
 // The output of the analysis
@@ -15,205 +17,254 @@ use std::collections::HashSet;
 type LocalCallee = usize;
 
 /// Store all the dependencies between one function and its callee
+#[derive(Debug, Clone)]
 pub struct FunctionDependencies<'tcx> {
-    /// name of the function
-    name: mir::Constant<'tcx>,
-    /// name and type of all the arguments and the returned value to this
-    /// function
-    arguments: IndexVec<mir::Local, (Option<mir::Constant<'tcx>>, Ty<'tcx>)>,
+    /// name and type of the returned value and all the arguments to this function
+    arguments_name_and_type: IndexVec<mir::Local, (Option<Symbol>, ty::Ty<'tcx>)>,
     /// List of all call-sites inside the body of this function
-    callee: IndexVec<LocalCallee, Callee<'tcx>>,
+    callees: IndexVec<LocalCallee, Callee<'tcx>>,
 }
 
 /// Store the name of a called function and the source of all of its arguments
+#[derive(Debug, Clone)]
 pub struct Callee<'tcx> {
     /// name of the called function
-    name: mir::Constant<'tcx>,
-    /// source (possibly over-approximated) of the source of each argument to
+    name: mir::Operand<'tcx>, // FIXME: it should be Constant
+    /// source (possibly over-approximated) of the source of the arguments to
     /// this called function
-    arguments: IndexVec<mir::Local, HashSet<Origin<'tcx>>>,
+    arguments_source: Vec<Origin<'tcx>>,
 }
 
 /// Express one of the possible source of a given argument
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum Origin<'tcx> {
     /// A literal expression
-    Literal(mir::Constant<'tcx>),
+    Literal(ty::Const<'tcx>), // FIXME: it should probably be Const
     /// An argument of the function being analyzed
     FromArgument(mir::Local),
     /// The return value of a another callee
-    FromReturn(LocalCallee),
+    FromReturn(mir::Local),
 }
 
 // ************************************************************ //
 // Extract relationship between all the locals in a function
 
-// FIXME: -> IndexVec<mir::Local, Vec<mir::Local>>
-fn depends_from_args(mir: &mir::Body) -> IndexVec<mir::Local, bool> {
-    // TODO: extract the relationship between the local_variable and the argument to the
-    // function, an not just the boolean information that it cames from an argument
+fn extract_constant<'tcx>(mir: &mir::Body<'tcx>) -> HashSet<ty::Const<'tcx>> {
+    use mir::visit::Visitor;
 
-    // +1 because of the return value
-    let local_count = mir.arg_count + mir.local_decls.len() + 1;
+    #[derive(Default)]
+    struct Constants<'tcx> {
+        constants: HashSet<ty::Const<'tcx>>,
+    }
+    impl<'tcx> Visitor<'tcx> for Constants<'tcx> {
+        fn visit_constant(&mut self, constant: &mir::Constant<'tcx>, _: mir::Location) {
+            self.constants.insert(constant.literal.clone());
+        }
+    }
 
-    let mut dependencies: IndexVec<mir::Local, Vec<mir::Local>> = (0..local_count)
-        .map(|_| Vec::new())
-        .collect();
-    for basic_block in mir.basic_blocks() {
-        for statement in &basic_block.statements {
+    let mut search_constants = Constants::default();
+    search_constants.visit_body(mir);
 
-            let ignore = || {};
-            let mut add_dependency = |lvalue: mir::Local, rvalue: mir::Place<'_>| {
-                if let Some(rvalue) = rvalue.local_or_deref_local() {
-                    dependencies[lvalue].push(rvalue);
+    search_constants.constants
+}
+
+#[derive(Debug, Clone)]
+struct Dependencies<'tcx> {
+    pub dependencies: IndexVec<mir::Local, BitVec>,
+    pub constants: Vec<ty::Const<'tcx>>,
+    pub locals_count: usize,
+}
+fn direct_dependencies<'mir, 'tcx>(mir: &'mir mir::Body<'tcx>) -> Dependencies<'tcx> {
+    use mir::visit::Visitor;
+
+    // A variable can depends from other locals or from constants
+    // The bits in `dependencies` represent a dependency to
+    //  - the return value
+    //  - the arguments of the function
+    //  - the local variables
+    //  - temporaries
+    //  - constants
+    // The index of a dependency to a constant is its index in `constants` shifted by
+    // `locals_count`.
+    let locals_count = mir.local_decls.len();
+    let constants: Vec<ty::Const> = extract_constant(mir).into_iter().collect();
+    let mut dependencies = IndexVec::from_elem_n(
+        BitVec::from_elem(locals_count + constants.len(), false),
+        locals_count);
+
+    struct Assignments<'tcx, 'local> {
+        locals_count: usize,
+        constants: &'local Vec<ty::Const<'tcx>>,
+        dependencies: &'local mut IndexVec<mir::Local, BitVec>,
+    }
+    impl<'tcx, 'local> Assignments<'tcx, 'local> {
+        fn new(
+            locals_count: usize,
+            constants: &'local Vec<ty::Const<'tcx>>,
+            dependencies: &'local mut IndexVec<mir::Local, BitVec>,
+        ) -> Self {
+            Assignments {
+                constants,
+                dependencies,
+                locals_count,
+            }
+        }
+    }
+    impl<'tcx, 'local> Visitor<'tcx> for Assignments<'tcx, 'local> {
+        fn visit_assign(
+            &mut self,
+            lvalue: &mir::Place<'tcx>,
+            rvalue: &mir::Rvalue<'tcx>,
+            _: mir::Location)
+        {
+            let lvalue = lvalue.local;
+
+            let constants = self.constants;
+            let locals_count = self.locals_count;
+            let dependencies: &mut IndexVec<mir::Local, BitVec> = self.dependencies;
+
+            let get_id = |op: &mir::Operand<'tcx>| -> usize {
+                use mir::Operand::*;
+                match op {
+                    Copy(place) | Move(place) => {
+                        place.local.as_usize()
+                    },
+                    Constant(constant) => {
+                        locals_count + constants.iter().position(|cst| cst == constant.literal).unwrap()
+                    },
                 }
             };
 
-            match &statement.kind {
-                mir::StatementKind::Assign(assignment) => {
-                    let (lvalue, rvalue) = &**assignment;
-                    let lvalue = lvalue.as_local().unwrap();
-
-                    match rvalue {
-                        mir::Rvalue::Use(op) => {
-                            op.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                        },
-                        mir::Rvalue::Repeat(op, _) => {
-                            op.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                        },
-                        mir::Rvalue::Ref(_, _, rvalue) => {
-                            add_dependency(lvalue, *rvalue);
-                        },
-                        mir::Rvalue::ThreadLocalRef(_) => {
-                            () // TODO:add support to threadlocal;
-                        },
-                        mir::Rvalue::AddressOf(_, rvalue) => {
-                            add_dependency(lvalue, *rvalue);
-                        },
-                        mir::Rvalue::Len(_) => {
-                            ignore();
-                        },
-                        mir::Rvalue::Cast(_, op, _) => {
-                            op.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                        },
-                        mir::Rvalue::BinaryOp(_, op1, op2) => {
-                            op1.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                            op2.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                        },
-                        mir::Rvalue::CheckedBinaryOp(_, op1, op2) => {
-                            op1.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                            op2.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                        },
-                        mir::Rvalue::NullaryOp(_, _) => {
-                            ignore();
-                        },
-                        mir::Rvalue::UnaryOp(_, op) => {
-                            op.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                        },
-                        mir::Rvalue::Discriminant(_) => {
-                            ignore();
-                        },
-                        mir::Rvalue::Aggregate(_, operands) => {
-                            for op in operands {
-                                op.place().map(|rvalue| add_dependency(lvalue, rvalue));
-                            }
-                        },
-                    }
+            use mir::Rvalue::*;
+            match rvalue {
+                Use(op) | Repeat(op, _) | Cast(_, op, _) | UnaryOp(_, op) => {
+                    dependencies[lvalue].set(get_id(op), true);
                 },
-                mir::StatementKind::LlvmInlineAsm(assembly) => {
-                    let rustc_middle::mir::LlvmInlineAsm{asm: _, outputs, inputs} = &**assembly;
-                    let inputs = &**inputs;
-                    let outputs = &**outputs;
-                    for (_, lvalue) in inputs {
-                        if let Some(lvalue) = lvalue.place() {
-                            let lvalue = lvalue.as_local().unwrap();
-                            for rvalue in outputs {
-                                add_dependency(lvalue, *rvalue);
-                            }
-                        }
-                    }
+                Ref(_, _, place) | AddressOf(_, place) | Len(place) | Discriminant(place) => {
+                    dependencies[lvalue].set(place.local.as_usize(), true);
                 },
-                mir::StatementKind::FakeRead(..) 
-                | mir::StatementKind::SetDiscriminant {..} 
-                | mir::StatementKind::StorageLive(..) 
-                | mir::StatementKind::StorageDead(..) 
-                | mir::StatementKind::Retag(..) 
-                | mir::StatementKind::AscribeUserType(..) 
-                | mir::StatementKind::Coverage(..) 
-                | mir::StatementKind::Nop => {
-                    ignore();
+                ThreadLocalRef(_) => {
+                    () // TODO:add support to threadlocal
+                },
+                BinaryOp(_, op1, op2) | CheckedBinaryOp(_, op1, op2) => {
+                    dependencies[lvalue].set(get_id(op1), true);
+                    dependencies[lvalue].set(get_id(op2), true);
+                },
+                NullaryOp(_, _) => {
+                    () // no dependencies
+                },
+                Aggregate(_, ops) => {
+                    for op in ops {
+                        dependencies[lvalue].set(get_id(op), true);
+                    }
                 },
             }
         }
     }
 
-    let mut depends_from_args: IndexVec<mir::Local, Option<bool>> = (0..local_count)
-        .map(|_| None)
-        .collect();
-    for arg in mir.args_iter() {
-        depends_from_args[arg] = Some(true);
+    let mut search_constants = Assignments::new(locals_count, &constants, &mut dependencies);
+    search_constants.visit_body(mir);
+
+    Dependencies {
+        dependencies,
+        constants,
+        locals_count,
     }
-    while !depends_from_args.iter().all(Option::is_some) {
-        for (lvalue, dependencies) in dependencies.iter_enumerated() {
-            if depends_from_args[lvalue] == None {
-                if dependencies.iter().any(|rvalue| depends_from_args[*rvalue] == Some(true)) {
-                    depends_from_args[lvalue] = Some(true);
-                } else if dependencies.iter().all(|rvalue| depends_from_args[*rvalue] == Some(false)) {
-                    // Note: In case dependencies is empty, the condition is also true
-                    // No dependencies => it's a constant
-                    depends_from_args[lvalue] = Some(false);
+}
+
+fn propagate_dependencies<'tcx>(deps: Dependencies<'tcx>) -> Dependencies<'tcx> {
+    let Dependencies { mut dependencies, constants, locals_count } = deps;
+
+    // Propagate all dependencies
+    //
+    // Example:
+    //
+    // Lets imagine that we have a function with 6 locals (return value +
+    // arguments + compiler generated constant) and two constants with the
+    // following maxtrix of direct dependencies where a cross means that the
+    // local has a value that was set from the value of the associated
+    // dependency.
+    //
+    //       | dependencies
+    // local | _0 | _1 | _2 | _3 | _4 | _5 | cst1 | cst2
+    // ------|----|----|----|----|----|----|------|------
+    //   _0  |    |    |    |  X |    |    |      |
+    //   _1  |    |    |    |    |    |    |      |
+    //   _2  |    |    |    |  X |    |    |      |  X
+    //   _3  |    |  X |  X |    |    |    |      |
+    //   _4  |    |    |    |    |    |    |  X   |
+    //   _5  |    |    |    |    |  X |    |      |
+    //
+    // The local _0 depends from _3. This means that it indirectly depends from
+    // the dependencies of _3 (_1 and _2) and transitively from the dependencies
+    // of _1 (none) and _2 (_3 and cst2). Since _3 was already visited, this
+    // will not change anything. In conclusion _0 depends from _1, _2, _3 and
+    // cst2.
+    //
+    // After applying the same logic for all local, the matrix of dependencies
+    // becomes:
+    //
+    //       | dependencies
+    // local | _0 | _1 | _2 | _3 | _4 | _5 | cst1 | cst2
+    // ------|----|----|----|----|----|----|------|------
+    //   _0  |    |  X |  X |  X |    |    |      |  X
+    //   _1  |    |    |    |    |    |    |      |
+    //   _2  |    |  X |  X |  X |    |    |      |  X
+    //   _3  |    |  X |  X |  X |    |    |      |  X
+    //   _4  |    |    |    |    |    |    |  X   |
+    //   _5  |    |    |    |    |  X |    |  X   |
+
+    let mut previous_iteration = BitVec::from_elem(locals_count + constants.len(), false);
+    // FIXME: find better name for deps1 and deps2
+    // deps1 and deps2 are refs to a BitVec of dependencies
+    // FIXME: is there a better way to do it than this bubblesort-like algorithm?
+
+    for index in 0..dependencies.len() {
+        // Safely extract a mutable reference from the dependency list, then iterate (imutably
+        // of the other dependencies
+        let (left, rest) = dependencies.raw.split_at_mut(index);
+        let (deps1, right) = rest.split_first_mut().unwrap();
+        let other_dependencies = Iterator::chain(
+            left.iter().enumerate(),
+            right.iter().enumerate().map(|(i, x)| (i + 1, x)));
+
+        loop {
+            // reuse the same BitVec at each iteration to avoid useless
+            // allocations
+            previous_iteration.clear();
+            previous_iteration.or(deps1);
+
+            for (index, deps2) in other_dependencies.clone() {
+                if deps1[index] {
+                    deps1.or(deps2);
                 }
             }
+
+            // continue until we hit a stable point
+            if deps1 == &previous_iteration {
+                break;
+            }
         }
     }
-    let depends_from_args: IndexVec<mir::Local, bool> = depends_from_args
-        .iter()
-        .map(|has_dependency| has_dependency == &Some(true))
-        .collect();
-    depends_from_args
-}
-
-// ************************************************************ //
-// Extracting the informations about all function call
-
-struct SearchFunctionCall<'tcx, 'dependencies> {
-    inner_functions: Vec<(mir::Operand<'tcx>, bool)>,
-    depends_from_args: &'dependencies IndexVec<mir::Local, bool>,
-}
-
-impl<'tcx, 'dependencies> SearchFunctionCall<'tcx, 'dependencies> {
-    fn new(depends_from_args: &'dependencies IndexVec<mir::Local, bool>) -> Self {
-        SearchFunctionCall {
-            inner_functions: Vec::new(),
-            depends_from_args
-        }
-    }
-}
-
-
-impl<'tcx, 'dependencies> rustc_middle::mir::visit::Visitor<'tcx> for SearchFunctionCall<'tcx, 'dependencies> {
-    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, _location: mir::Location) {
-        if let TerminatorKind::Call{func, args, ..} = &terminator.kind {
-            let depends_from_caller = args
-                .iter()
-                .any(|arg| {
-                    arg
-                        .place()
-                        .map(|p| {
-                            p.local_or_deref_local().map(|local| self.depends_from_args[local])
-                        })
-                        .flatten()
-                        .unwrap_or(false)
-                });
-            self.inner_functions.push((func.clone(), depends_from_caller));
-        }
-    }
+    Dependencies { dependencies, constants, locals_count }
 }
 
 // ************************************************************ //
 // Utilities
 
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
+struct Module(String);
+
+impl fmt::Display for Module {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Return the name of the module of a given function
-fn get_module(tcx: TyCtxt<'_>, function: DefId) -> String {
+fn get_module(tcx: ty::TyCtxt<'_>, function: DefId) -> Module {
+    use ty::DefIdTree;
+
     let mut current = function;
     // The immediate parent might not always be a module.
     // Find the first parent which is.
@@ -242,93 +293,244 @@ fn get_module(tcx: TyCtxt<'_>, function: DefId) -> String {
     } else {
         crate_name += "::";
     }
-    crate_name + &def_path.data.iter().map(|m| format!("{}", m)).join("::")
+    Module(crate_name + &def_path.data.iter().map(|m| format!("{}", m)).join("::"))
 }
 
-#[derive(Clone)]
-enum Function {
-    Direct(DefId, bool),
-    Monomorphized(DefId, String, bool),
-}
+/// Intraprocedural analysis that extract the relation between the arguments and the return value of
+/// both the function and all called functions.
+pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
+    use mir::visit::Visitor;
 
-pub fn extract_dependencies(tcx: TyCtxt<'_>) {
-    let mut functions: HashSet<DefId> = HashSet::new();
-    let mut monomorphized_functions: HashSet<(DefId, String)> = HashSet::new();
-    let mut dependencies: Vec<(DefId, Function)> = Vec::new();
+    #[derive(Clone)]
+    struct CallSite<'tcx> {
+        return_variable: Option<mir::Local>,
+        function: mir::Operand<'tcx>,
+        arguments: Vec<mir::Operand<'tcx>>,
+    }
 
-    for caller in tcx.body_owners() {
-        let mir = tcx.mir_built(rustc_middle::ty::WithOptConstParam {
-            did: caller,
-            const_param_did: tcx.opt_const_param_of(caller)
-        });
-        let mir = &mir.borrow();
+    #[derive(Default, Clone)]
+    struct SearchFunctionCall<'tcx> {
+        callees: Vec<CallSite<'tcx>>,
+    }
 
-        let depends_from_args = depends_from_args(&mir);
+    impl<'tcx> SearchFunctionCall<'tcx> {
+        fn new() -> Self {
+            default()
+        }
+    }
 
-        let mut subfunctions = SearchFunctionCall::new(&depends_from_args);
-        subfunctions.visit_body(mir);
-
-        let caller = caller.to_def_id();
-        functions.insert(caller);
-
-        for (subfunction, depends_from_caller) in subfunctions.inner_functions {
-            // TODO: take a look at
-            // https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TyCtxt.html#method.upstream_monomorphizations_for
-            let callee_id = if let rustc_middle::ty::FnDef(def_id, _) = subfunction.constant().unwrap().literal.ty.kind() {
-                *def_id
-            } else {
-                unreachable!();
-            };
-            functions.insert(callee_id);
-
-            let callee_str = tcx.def_path_str(callee_id);
-            let full_name = format!("{:?}", subfunction);
-            let monomorphized_call = full_name != callee_str;
-            if monomorphized_call {
-                monomorphized_functions.insert((callee_id, full_name.clone()));
-                dependencies.push((caller, Function::Monomorphized(callee_id, full_name, depends_from_caller)));
-            } else {
-                dependencies.push((caller, Function::Direct(callee_id, depends_from_caller)));
+    impl<'tcx> Visitor<'tcx> for SearchFunctionCall<'tcx> {
+        fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, _location: mir::Location) {
+            if let TerminatorKind::Call{func, args, destination, ..} = &terminator.kind {
+                self.callees.push(CallSite{
+                    return_variable: destination.map(|(place, _)| place.local),
+                    function: func.clone(),
+                    arguments: args.to_vec(),
+                });
             }
         }
     }
 
+    // let mut monomorphized_functions: HashSet<(DefId, String)> = default();
+    let dependencies: HashMap<DefId, FunctionDependencies> = tcx
+        .body_owners()
+        .map(|caller| {
+            let mir = tcx.mir_built(ty::WithOptConstParam {
+                did: caller,
+                const_param_did: tcx.opt_const_param_of(caller)
+            });
+            let mir = mir.steal();
+
+            let callsites: Vec<CallSite> = {
+                let mut search_callees = SearchFunctionCall::new();
+                search_callees.visit_body(&mir);
+                search_callees.callees
+            };
+
+            // Note: arguments[0] == return type, then it's the arguments of the function
+            let arguments_name_and_type: IndexVec<mir::Local, (Option<Symbol>, ty::Ty)> = (0..=mir.arg_count)
+                .map(mir::Local::from_usize)
+                .map(|arg| {
+                    let name = mir.var_debug_info
+                        .iter()
+                        .find(|debug| debug.place.local == arg)
+                        .map(|debug| debug.name);
+                    let ty = mir.local_decls[arg].ty;
+                    (name, ty)
+                })
+                .collect();
+
+            let deps = direct_dependencies(&mir);
+            let deps = propagate_dependencies(deps);
+            let Dependencies {
+                dependencies,
+                constants,
+                locals_count,
+            } = deps;
+
+            let mut is_return_variable = BitVec::from_elem(locals_count + constants.len(), false);
+            for callsite in &callsites {
+                if let Some(ret) = callsite.return_variable {
+                    is_return_variable.set(ret.as_usize(), true);
+                }
+            }
+
+            // The source of all locals, are:
+            //  - the arguments to the current function
+            //  - constants
+            //  - the return value of called functions
+            let is_argument = |idx: usize| idx < mir.arg_count + 1;
+            let is_constant = |idx: usize| idx > locals_count;
+            let is_return_variable = |idx: usize| is_return_variable[idx];
+
+            // fn is_callable(ty: ty::Ty) -> bool {
+            //     ty.is_fn() || ty.is_fn_ptr() || ty.is_closure()
+            // }
+
+            let get_callee_id = |id: usize| {
+                callsites
+                    .iter()
+                    .position(|callsite| callsite.return_variable == Some(mir::Local::from_usize(id)))
+                    .unwrap()
+            };
+
+            let callees = callsites
+                .iter()
+                .map(|callsite| {
+                    Callee {
+                        name: callsite.function.clone(),
+                        arguments_source: callsite.arguments
+                            // merge the dependencies of all arguments
+                            .iter()
+                            .map(|arg| {
+                                use mir::Operand::*;
+                                match arg {
+                                    Copy(place) | Move(place) => dependencies[place.local].clone(),
+                                    Constant(cst) => {
+                                        let mut bitmask = BitVec::from_elem(locals_count + constants.len(), false);
+                                        bitmask.set(constants.iter().position(|cst_| cst_ == cst.literal).unwrap(), true);
+                                        bitmask
+                                    },
+                                }
+                            })
+                            .fold(BitVec::from_elem(locals_count + constants.len(), false), |mut all_dependency, dependency_of_arg| {
+                                all_dependency.or(&dependency_of_arg);
+                                all_dependency
+                            })
+                            // search their respective source
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(id, has_dependency)| {
+                                has_dependency.then_some(id)
+                            })
+                            .filter_map(|id| {
+                                if is_argument(id) {
+                                    Some(Origin::FromArgument(mir::Local::from_usize(id)))
+                                } else if is_constant(id) {
+                                    Some(Origin::Literal(constants[id - locals_count].clone()))
+                                } else if is_return_variable(id) {
+                                    Some(Origin::FromReturn(mir::Local::from_usize(get_callee_id(id))))
+                                } else {
+                                    // Ignore dependencies to local variables
+                                    None
+                                }
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+
+            (caller.to_def_id(), FunctionDependencies {
+                arguments_name_and_type,
+                callees,
+            })
+        })
+        .collect();
+
+    let functions: HashMap<Module, DefId> = dependencies
+        .iter()
+        .map(|&function, _| (function, get_module(tcx, function)))
+        .collect();
+
+//  /////////////////////////////
+//
+//      let mut subfunctions = SearchFunctionCall::new(&depends_from_args);
+//      subfunctions.visit_body(mir);
+//
+//      let caller = caller.to_def_id();
+//      functions.insert(caller);
+//
+//      for (subfunction, depends_from_caller) in subfunctions.inner_functions {
+//          // TODO: take a look at
+//          // https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TyCtxt.html#method.upstream_monomorphizations_for
+//          let callee_id = if let rustc_middle::ty::FnDef(def_id, _) = subfunction.constant().unwrap().literal.ty.kind() {
+//              *def_id
+//          } else {
+//              unreachable!();
+//          };
+//          functions.insert(callee_id);
+//
+//          let callee_str = tcx.def_path_str(callee_id);
+//          let full_name = format!("{:?}", subfunction);
+//          let monomorphized_call = full_name != callee_str;
+//          if monomorphized_call {
+//              monomorphized_functions.insert((callee_id, full_name.clone()));
+//              dependencies.push((caller, Function::Monomorphized(callee_id, full_name, depends_from_caller)));
+//          } else {
+//              dependencies.push((caller, Function::Direct(callee_id, depends_from_caller)));
+//          }
+//      }
+//  }
+//
+//  // Group item by module
+//  // TODO: create a hierarchy of module
+//  let modules: HashSet<_> = functions
+//      .iter()
+//      .map(|&f| get_module(tcx, f))
+//      .collect();
+//  let modules: HashMap<String, usize> = modules
+//      .into_iter()
+//      .enumerate()
+//      .map(|(id, name)| (name, id))
+//      .collect();
+//
+//  let functions = {
+//      let mut _functions: HashMap<String, Vec<DefId>> = modules
+//          .iter()
+//          .map(|(name, _)| (name.clone(), Vec::new()))
+//          .collect();
+//      for function in functions {
+//          _functions.get_mut(&get_module(tcx, function)).unwrap().push(function);
+//      }
+//      for &(id, _) in &monomorphized_functions {
+//          _functions.get_mut(&get_module(tcx, id)).unwrap().push(id);
+//      }
+//      _functions
+//  };
+//
+//  let monomorphized_functions = {
+//      let mut _functions: HashMap<String, Vec<String>> = modules
+//          .iter()
+//          .map(|(name, _)| (name.clone(), Vec::new()))
+//          .collect();
+//      for (id, full_name) in monomorphized_functions {
+//          _functions.get_mut(&get_module(tcx, id)).unwrap().push(full_name);
+//      }
+//      _functions
+//  };
+//
+//  /////////////////////////////
+
+
     // Group item by module
     // TODO: create a hierarchy of module
-    let modules: HashSet<_> = functions
-        .iter()
-        .map(|&f| get_module(tcx, f))
-        .collect();
-    let modules: HashMap<String, usize> = modules
-        .into_iter()
-        .enumerate()
-        .map(|(id, name)| (name, id))
+    let modules: HashSet<Module> = functions
+        .keys()
         .collect();
 
-    let functions = {
-        let mut _functions: HashMap<String, Vec<DefId>> = modules
-            .iter()
-            .map(|(name, _)| (name.clone(), Vec::new()))
-            .collect();
-        for function in functions {
-            _functions.get_mut(&get_module(tcx, function)).unwrap().push(function);
-        }
-        for &(id, _) in &monomorphized_functions {
-            _functions.get_mut(&get_module(tcx, id)).unwrap().push(id);
-        }
-        _functions
-    };
+    let monomorphized_functions: HashMap<
 
-    let monomorphized_functions = {
-        let mut _functions: HashMap<String, Vec<String>> = modules
-            .iter()
-            .map(|(name, _)| (name.clone(), Vec::new()))
-            .collect();
-        for (id, full_name) in monomorphized_functions {
-            _functions.get_mut(&get_module(tcx, id)).unwrap().push(full_name);
-        }
-        _functions
-    };
+    // let dependencies: HashMap<DefId, FunctionDependencies> = tcx
 
     eprintln!("strict digraph {{");
 
@@ -360,29 +562,31 @@ pub fn extract_dependencies(tcx: TyCtxt<'_>) {
         eprintln!("    }}");
     }
 
-    eprintln!("\n    // dependency graph");
-    for (caller, callee) in dependencies {
-        match callee {
-            Function::Direct(callee_id, depends_from_caller) => {
-                let caller = tcx.def_path_str(caller);
-                let callee_str = tcx.def_path_str(callee_id);
-                eprintln!("    \"{}\" -> \"{}\"", caller, callee_str);
-                if depends_from_caller {
-                    eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, caller);
-                }
-            },
-            Function::Monomorphized(callee_id, full_name, depends_from_caller) => {
-                let caller = tcx.def_path_str(caller);
-                let callee_str = tcx.def_path_str(callee_id);
-                eprintln!("    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name);
-                eprintln!("    \"{}\" -> \"{}\"", full_name, callee_str);
-                if depends_from_caller {
-                    eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name);
-                    eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", full_name, caller);
-                }
-            }
-        }
-    }
+    // TODO
+    //
+    // eprintln!("\n    // dependency graph");
+    // for (caller, callee) in dependencies {
+    //     match callee {
+    //         Function::Direct(callee_id, depends_from_caller) => {
+    //             let caller = tcx.def_path_str(caller);
+    //             let callee_str = tcx.def_path_str(callee_id);
+    //             eprintln!("    \"{}\" -> \"{}\"", caller, callee_str);
+    //             if depends_from_caller {
+    //                 eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, caller);
+    //             }
+    //         },
+    //         Function::Monomorphized(callee_id, full_name, depends_from_caller) => {
+    //             let caller = tcx.def_path_str(caller);
+    //             let callee_str = tcx.def_path_str(callee_id);
+    //             eprintln!("    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name);
+    //             eprintln!("    \"{}\" -> \"{}\"", full_name, callee_str);
+    //             if depends_from_caller {
+    //                 eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name);
+    //                 eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", full_name, caller);
+    //             }
+    //         }
+    //     }
+    // }
 
     eprintln!("}}");
 }

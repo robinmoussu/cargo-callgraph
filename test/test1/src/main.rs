@@ -21,11 +21,11 @@ pub mod m1 {
 
 pub mod m2 {
     pub fn bar() {
-        baz();
+        //baz();
     }
 
-    fn baz() {
-        println!("hello word");
-    }
+    // fn baz() {
+    //     println!("hello word");
+    // }
 }
 
