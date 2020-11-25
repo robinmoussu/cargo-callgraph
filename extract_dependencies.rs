@@ -26,11 +26,18 @@ pub struct FunctionDependencies<'tcx> {
     callees: IndexVec<LocalCallee, Callee<'tcx>>,
 }
 
+#[derive(Clone, Debug)]
+enum CallType<'tcx> {
+    DirectCall(DefId),
+    IndirectCall(DefId, Vec<Origin<'tcx>>),
+    FromLocalPointer(Vec<Origin<'tcx>>),
+}
+
 /// Store the name of a called function and the source of all of its arguments
 #[derive(Debug, Clone)]
 pub struct Callee<'tcx> {
     /// name of the called function
-    name: mir::Operand<'tcx>, // FIXME: it should be Constant
+    function: CallType<'tcx>,
     /// source (possibly over-approximated) of the source of the arguments to
     /// this called function
     arguments_source: Vec<Origin<'tcx>>,
@@ -40,7 +47,7 @@ pub struct Callee<'tcx> {
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum Origin<'tcx> {
     /// A literal expression
-    Literal(ty::Const<'tcx>), // FIXME: it should probably be Const
+    Literal(ty::Const<'tcx>),
     /// An argument of the function being analyzed
     FromArgument(mir::Local),
     /// The return value of a another callee
@@ -75,6 +82,14 @@ struct Dependencies<'tcx> {
     pub constants: Vec<ty::Const<'tcx>>,
     pub locals_count: usize,
 }
+
+impl<'tcx> Dependencies<'tcx> {
+    fn constant(&self, idx: usize) -> ty::Const<'tcx> {
+        assert!(idx >= self.locals_count);
+        self.constants[idx - self.locals_count]
+    }
+}
+
 fn direct_dependencies<'mir, 'tcx>(mir: &'mir mir::Body<'tcx>) -> Dependencies<'tcx> {
     use mir::visit::Visitor;
 
@@ -303,10 +318,17 @@ fn get_module(tcx: ty::TyCtxt<'_>, function: DefId) -> Module {
     Module(crate_name + &def_path.data.iter().map(|m| format!("{}", m)).join("::"))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
+enum LocalCallType {
+    DirectCall(DefId),
+    IndirectCall(DefId, mir::Local),
+    LocalFunctionPtr(mir::Local),
+}
+
+#[derive(Clone, Debug)]
 struct CallSite<'tcx> {
     return_variable: Option<mir::Local>,
-    function: mir::Operand<'tcx>,
+    function: LocalCallType,
     arguments: Vec<mir::Operand<'tcx>>,
 }
 
@@ -333,21 +355,39 @@ fn extract_function_call<'tcx>(tcx: ty::TyCtxt<'tcx>, mir: &mir::Body<'tcx>) -> 
     impl<'tcx, 'local> Visitor<'tcx> for SearchFunctionCall<'tcx, 'local> {
         fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, _location: mir::Location) {
             if let TerminatorKind::Call{func, args, destination, ..} = &terminator.kind {
-                use ty::TyKind::*;
-                let callee_fct = func
-                    .constant()
-                    .map(|cst| match *cst.literal.ty.kind() {
-                        FnDef(def_id, _) => Some(self.tcx.def_path_str(def_id)),
-                        _ => None,
-                    })
-                    .flatten();
-                dbg!(callee_fct);
-                dbg!(&args.first().map(|arg| arg.ty(self.caller, self.tcx)));
-                eprintln!();
+                use mir::Operand::*;
+                let function = match func {
+                    Constant(cst) => {
+                        if let ty::TyKind::FnDef(def_id, _) = cst.literal.ty.kind() {
+                            let def_id = *def_id;
+
+                            use def::DefKind::*;
+                            match self.tcx.def_kind(def_id) {
+                                Fn => LocalCallType::DirectCall(def_id),
+                                AssocFn => match &args[0] {
+                                    Move(place) | Copy(place) => LocalCallType::IndirectCall(def_id, place.local),
+                                    Constant(cst) => {
+                                        if let ty::TyKind::FnDef(def_id, _) = cst.literal.ty.kind() {
+                                            LocalCallType::DirectCall(*def_id)
+                                        } else {
+                                            panic!()
+                                        }
+                                    },
+                                },
+                                other => {
+                                    panic!("unknow call type: {:?}", other);
+                                }
+                            }
+                        } else {
+                            panic!("unknow call type: {:?}", cst);
+                        }
+                    },
+                    Move(place) | Copy(place) => LocalCallType::LocalFunctionPtr(place.local),
+                };
 
                 self.callees.push(CallSite{
                     return_variable: destination.map(|(place, _)| place.local),
-                    function: func.clone(),
+                    function,
                     arguments: args.to_vec(),
                 });
             }
@@ -366,8 +406,6 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
     let dependencies: HashMap<DefId, FunctionDependencies> = tcx
         .body_owners()
         .map(|caller| {
-            eprintln!();
-            dbg!(tcx.def_path_str(caller.to_def_id()));
             let mir = tcx.mir_built(ty::WithOptConstParam {
                 did: caller,
                 const_param_did: tcx.opt_const_param_of(caller)
@@ -391,80 +429,133 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
 
             let deps = direct_dependencies(&mir);
             let deps = propagate_dependencies(deps);
-            let Dependencies {
-                dependencies,
-                constants,
-                locals_count,
-            } = deps;
 
-            let mut is_return_variable = BitVec::from_elem(locals_count + constants.len(), false);
-            for callsite in &callsites {
-                if let Some(ret) = callsite.return_variable {
-                    is_return_variable.set(ret.as_usize(), true);
+            struct XXX<'mir, 'deps, 'tcx> {
+                mir: &'mir mir::Body<'tcx>,
+                deps: &'deps Dependencies<'tcx>,
+                // callsites: &'callsites Vec<CallSite<'tcx>>,
+                is_return_variable: BitVec,
+            }
+            impl<'mir, 'deps, 'tcx> XXX<'mir, 'deps, 'tcx> {
+                pub fn new(mir: &'mir mir::Body<'tcx>, deps: &'deps Dependencies<'tcx>, callsites: &Vec<CallSite<'tcx>>) -> Self {
+                    let mut is_return_variable = BitVec::from_elem(deps.locals_count + deps.constants.len(), false);
+                    is_return_variable.set(0, true);
+                    for callsite in callsites {
+                        if let Some(ret) = callsite.return_variable {
+                            is_return_variable.set(ret.as_usize(), true);
+                        }
+                    }
+
+                    XXX {
+                        mir,
+                        deps,
+                        // callsites,
+                        is_return_variable,
+                    }
+                }
+
+                // The source of all locals, are:
+                //  - the arguments to the current function
+                //  - constants
+                //  - the return value of called functions
+                fn is_argument(&self, idx: usize) -> bool {
+                    // + 1 for the return value of the function
+                    0 < idx && idx < self.mir.arg_count + 1
+                }
+                fn is_constant(&self, idx: usize) -> bool {
+                    idx >= self.deps.locals_count
+                }
+                fn is_return_variable(&self, idx: usize) -> bool {
+                    self.is_return_variable[idx]
+                }
+
+                // fn is_callable(ty: ty::Ty) -> bool {
+                //     ty.is_fn() || ty.is_fn_ptr() || ty.is_closure()
+                // }
+
+                // fn get_callee_id(&self, id: usize) -> usize {
+                //     self.callsites
+                //         .iter()
+                //         .position(|callsite| callsite.return_variable == Some(mir::Local::from_usize(id)))
+                //         .unwrap()
+                // }
+
+                pub fn get_origins(&self, dependencies: &BitVec) -> Vec<Origin<'tcx>> {
+                    dependencies
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, is_dependency)| *is_dependency)
+                        .filter_map(|(id, _)| {
+                            if self.is_return_variable(id) {
+                                Some(Origin::FromReturn(mir::Local::from_usize(id)))
+                            } else if self.is_argument(id) {
+                                Some(Origin::FromArgument(mir::Local::from_usize(id)))
+                            } else if self.is_constant(id) {
+                                Some(Origin::Literal(self.deps.constant(id)))
+                            } else {
+                                // ignore local variable
+                                None
+                            }
+                        })
+                        .collect()
+                }
+
+                fn origins_from_local(&self, local: mir::Local) -> Vec<Origin<'tcx>> {
+                    self.get_origins(&self.deps.dependencies[local])
+                }
+
+                pub fn get_source(&self, fct: &LocalCallType) -> CallType<'tcx> {
+                    use LocalCallType::*;
+                    match fct {
+                        DirectCall(def_id) => CallType::DirectCall(*def_id),
+                        IndirectCall(def_id, local) => CallType::IndirectCall(*def_id, self.origins_from_local(*local)),
+                        LocalFunctionPtr(local) => {
+                            let origins = self.origins_from_local(*local);
+                            if origins.len() == 1 {
+                                if let Origin::Literal(cst) = origins[0] {
+                                    if let ty::TyKind::FnDef(def_id, _) = cst.ty.kind() {
+                                        CallType::DirectCall(*def_id)
+                                    } else {
+                                        panic!()
+                                    }
+                                } else {
+                                    CallType::FromLocalPointer(origins)
+                                }
+                            } else {
+                                CallType::FromLocalPointer(origins)
+                            }
+                        },
+                    }
                 }
             }
 
-            // The source of all locals, are:
-            //  - the arguments to the current function
-            //  - constants
-            //  - the return value of called functions
-            let is_argument = |idx: usize| idx < mir.arg_count + 1;
-            let is_constant = |idx: usize| idx > locals_count;
-            let is_return_variable = |idx: usize| is_return_variable[idx];
-
-            // fn is_callable(ty: ty::Ty) -> bool {
-            //     ty.is_fn() || ty.is_fn_ptr() || ty.is_closure()
-            // }
-
-            let get_callee_id = |id: usize| {
-                callsites
-                    .iter()
-                    .position(|callsite| callsite.return_variable == Some(mir::Local::from_usize(id)))
-                    .unwrap()
-            };
-
+            let xxx = XXX::new(&mir, &deps, &callsites);
             let callees = callsites
                 .iter()
                 .map(|callsite| {
                     Callee {
-                        name: callsite.function.clone(),
-                        arguments_source: callsite.arguments
-                            // merge the dependencies of all arguments
-                            .iter()
-                            .map(|arg| {
-                                use mir::Operand::*;
-                                match arg {
-                                    Copy(place) | Move(place) => dependencies[place.local].clone(),
-                                    Constant(cst) => {
-                                        let mut bitmask = BitVec::from_elem(locals_count + constants.len(), false);
-                                        bitmask.set(constants.iter().position(|cst_| cst_ == cst.literal).unwrap(), true);
-                                        bitmask
-                                    },
-                                }
-                            })
-                            .fold(BitVec::from_elem(locals_count + constants.len(), false), |mut all_dependency, dependency_of_arg| {
-                                all_dependency.or(&dependency_of_arg);
-                                all_dependency
-                            })
-                            // search their respective source
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(id, has_dependency)| {
-                                has_dependency.then_some(id)
-                            })
-                            .filter_map(|id| {
-                                if is_argument(id) {
-                                    Some(Origin::FromArgument(mir::Local::from_usize(id)))
-                                } else if is_constant(id) {
-                                    Some(Origin::Literal(constants[id - locals_count].clone()))
-                                } else if is_return_variable(id) {
-                                    Some(Origin::FromReturn(mir::Local::from_usize(get_callee_id(id))))
-                                } else {
-                                    // Ignore dependencies to local variables
-                                    None
-                                }
-                            })
-                            .collect(),
+                        function: xxx.get_source(&callsite.function),
+                        arguments_source: {
+                            let dependencies = callsite.arguments
+                                // merge the dependencies of all arguments
+                                .iter()
+                                .map(|arg| {
+                                    use mir::Operand::*;
+                                    match arg {
+                                        Copy(place) | Move(place) => deps.dependencies[place.local].clone(),
+                                        Constant(cst) => {
+                                            let mut bitmask = BitVec::from_elem(deps.locals_count + deps.constants.len(), false);
+                                            bitmask.set(deps.constants.iter().position(|cst_| cst_ == cst.literal).unwrap(), true);
+                                            bitmask
+                                        },
+                                    }
+                                })
+                                .fold(BitVec::from_elem(deps.locals_count + deps.constants.len(), false), |mut all_dependency, dependency_of_arg| {
+                                    all_dependency.or(&dependency_of_arg);
+                                    all_dependency
+                                });
+                            xxx.get_origins(&dependencies)
+                        },
                     }
                 })
                 .collect();
@@ -554,22 +645,22 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
         functions
     };
 
-    // FIXME: this doesn't work
-    let monomorphized_functions: HashSet<DefId> = dependencies
-        .iter()
-        .map(|(_, FunctionDependencies{callees, ..})| callees.iter())
-        .flatten()
-        .map(|callee| &callee.name)
-        .filter_map(|callee: &mir::Operand| {
-            let generic_name = format!("{:?}", callee);
-            callee
-                .constant()
-                .map(|cst| cst.check_static_ptr(tcx))
-                .flatten()
-                .map(|def_id| (tcx.def_path_str(def_id) != generic_name).then_some(def_id))
-                .flatten()
-        })
-        .collect();
+    // // FIXME: this doesn't work
+    // let monomorphized_functions: HashSet<DefId> = dependencies
+    //     .iter()
+    //     .map(|(_, FunctionDependencies{callees, ..})| callees.iter())
+    //     .flatten()
+    //     .map(|callee| &callee.name)
+    //     .filter_map(|callee: &mir::Operand| {
+    //         let generic_name = format!("{:?}", callee);
+    //         callee
+    //             .constant()
+    //             .map(|cst| cst.check_static_ptr(tcx))
+    //             .flatten()
+    //             .map(|def_id| (tcx.def_path_str(def_id) != generic_name).then_some(def_id))
+    //             .flatten()
+    //     })
+    //     .collect();
 
     // Group item by module
     // TODO: create a hierarchy of module
@@ -605,99 +696,47 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
         // create function nodes
         for &function in &functions[module_name] {
             let name = tcx.def_path_str(function);
-            if monomorphized_functions.contains(&function) {
-                // create virtual nodes for monomorphized call");
-                eprintln!("        \"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", name);
-            } else {
+            // if monomorphized_functions.contains(&function) {
+            //     // create virtual nodes for monomorphized call");
+            //     eprintln!("        \"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", name);
+            // } else {
                 eprintln!("        \"{}\" [shape=none]", name);
-            }
+            // }
         }
 
 
         eprintln!("    }}");
     }
 
-// let dependencies: HashMap<DefId, FunctionDependencies>
-//
-// /// Store all the dependencies between one function and its callee
-// #[derive(Debug, Clone)]
-// pub struct FunctionDependencies<'tcx> {
-//     /// name and type of the returned value and all the arguments to this function
-//     arguments_name_and_type: IndexVec<mir::Local, (Option<Symbol>, ty::Ty<'tcx>)>,
-//     /// List of all call-sites inside the body of this function
-//     callees: IndexVec<LocalCallee, Callee<'tcx>>,
-// }
-// 
-// /// Store the name of a called function and the source of all of its arguments
-// #[derive(Debug, Clone)]
-// pub struct Callee<'tcx> {
-//     /// name of the called function
-//     name: mir::Operand<'tcx>, // FIXME: it should be Constant
-
-//     /// this called function
-//     arguments_source: Vec<Origin<'tcx>>,
-// }
-// 
-// /// Express one of the possible source of a given argument
-// #[derive(Debug, Clone, Eq, PartialEq, Hash)]
-// pub enum Origin<'tcx> {
-//     /// A literal expression
-//     Literal(ty::Const<'tcx>), // FIXME: it should probably be Const
-//     /// An argument of the function being analyzed
-//     FromArgument(mir::Local),
-//     /// The return value of a another callee
-//     FromReturn(mir::Local),
-// }
-
-
     eprintln!("\n    // dependency graph");
     for (caller, info) in dependencies {
         let caller = tcx.def_path_str(caller);
         for callee in &info.callees {
-            if let Some(ty::TyKind::FnDef(def_id, _)) = callee
-                .name
-                .constant()
-                .map(|cst| cst.literal.ty.kind())
-            {
-                let def_id = *def_id;
-                let callee_name = tcx.def_path_str(def_id);
-
-                use def::DefKind::*;
-                match tcx.def_kind(def_id) {
-                    Fn => {
-                        eprintln!("    \"{}\" -> \"{}\"", caller, callee_name);
+            use CallType::*;
+            match &callee.function {
+                DirectCall(callee_id) => {
+                    let callee_str = tcx.def_path_str(*callee_id);
+                    eprintln!("    \"{}\" -> \"{}\"", caller, callee_str);
+                    // if depends_from_caller {
+                    //     eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, caller);
+                    // }
+                },
+                IndirectCall(callee_id, dependencies) => {
+                    let callee = tcx.def_path_str(*callee_id);
+                    eprintln!("    \"{}\" -> \"{}\" // -> {:?}", caller, callee, dependencies);
+                    // eprintln!("    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name);
+                    // eprintln!("    \"{}\" -> \"{}\"", full_name, callee_str);
+                    // if depends_from_caller {
+                    //     eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name);
+                    //     eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", full_name, caller);
+                    // }
+                },
+                FromLocalPointer(ptrs) => {
+                    for ptr in ptrs {
+                        eprintln!("    // \"{}\" -> \"{:?}\"", caller, ptr);
                     }
-                    AssocFn => {
-                        eprintln!("    \"{}\" -> \"{}\" // indirect call", caller, callee_name);
-                    },
-                    other => {
-                        eprintln!("    // {} -> {} // ??? {:?}", caller, callee_name, other);
-                    }
-                }
-            } else {
-                eprintln!("    // {} -> {:?}", caller, callee.name);
+                },
             }
-
-
-            // match callee {
-            //     Function::Direct(callee_id, depends_from_caller) => {
-            //         let callee_str = tcx.def_path_str(callee_id);
-            //         eprintln!("    \"{}\" -> \"{}\"", caller, callee_str);
-            //         if depends_from_caller {
-            //             eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, caller);
-            //         }
-            //     },
-            //     Function::Monomorphized(callee_id, full_name, depends_from_caller) => {
-            //         let caller = tcx.def_path_str(caller);
-            //         let callee_str = tcx.def_path_str(callee_id);
-            //         eprintln!("    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name);
-            //         eprintln!("    \"{}\" -> \"{}\"", full_name, callee_str);
-            //         if depends_from_caller {
-            //             eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name);
-            //             eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", full_name, caller);
-            //         }
-            //     }
-            // }
         }
     }
 
