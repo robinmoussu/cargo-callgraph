@@ -29,7 +29,7 @@ pub struct FunctionDependencies<'tcx> {
 #[derive(Clone, Debug)]
 enum CallType<'tcx> {
     DirectCall(DefId),
-    IndirectCall(DefId, Vec<Origin<'tcx>>),
+    // IndirectCall(DefId, Vec<Origin<'tcx>>),
     FromLocalPointer(Vec<Origin<'tcx>>),
 }
 
@@ -321,7 +321,7 @@ fn get_module(tcx: ty::TyCtxt<'_>, function: DefId) -> Module {
 #[derive(Clone, Debug)]
 enum LocalCallType {
     DirectCall(DefId),
-    IndirectCall(DefId, mir::Local),
+    // IndirectCall(DefId, mir::Local),
     LocalFunctionPtr(mir::Local),
 }
 
@@ -363,17 +363,17 @@ fn extract_function_call<'tcx>(tcx: ty::TyCtxt<'tcx>, mir: &mir::Body<'tcx>) -> 
 
                             use def::DefKind::*;
                             match self.tcx.def_kind(def_id) {
-                                Fn => LocalCallType::DirectCall(def_id),
-                                AssocFn => match &args[0] {
-                                    Move(place) | Copy(place) => LocalCallType::IndirectCall(def_id, place.local),
-                                    Constant(cst) => {
-                                        if let ty::TyKind::FnDef(def_id, _) = cst.literal.ty.kind() {
-                                            LocalCallType::DirectCall(*def_id)
-                                        } else {
-                                            panic!()
-                                        }
-                                    },
-                                },
+                                Fn | AssocFn => LocalCallType::DirectCall(def_id),
+                                // AssocFn => match &args[0] {
+                                //     Move(place) | Copy(place) => LocalCallType::IndirectCall(def_id, place.local),
+                                //     Constant(cst) => {
+                                //         if let ty::TyKind::FnDef(def_id, _) = cst.literal.ty.kind() {
+                                //             LocalCallType::DirectCall(*def_id)
+                                //         } else {
+                                //             panic!()
+                                //         }
+                                //     },
+                                // },
                                 other => {
                                     panic!("unknow call type: {:?}", other);
                                 }
@@ -399,6 +399,15 @@ fn extract_function_call<'tcx>(tcx: ty::TyCtxt<'tcx>, mir: &mir::Body<'tcx>) -> 
     search_callees.callees
 }
 
+fn get_generic_name(tcx: ty::TyCtxt<'_>, def_id: DefId) -> String {
+    match tcx.opt_associated_item(def_id) {
+        Some(ty::AssocItem{def_id, ..}) => {
+            tcx.def_path_str(*def_id)
+        },
+        None => tcx.def_path_str(def_id),
+    }
+}
+
 /// Intraprocedural analysis that extract the relation between the arguments and the return value of
 /// both the function and all called functions.
 pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
@@ -410,7 +419,7 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
                 did: caller,
                 const_param_did: tcx.opt_const_param_of(caller)
             });
-            let mir = mir.steal();
+            let mir = mir.borrow();
 
             let callsites: Vec<CallSite> = extract_function_call(tcx, &mir);
 
@@ -508,7 +517,7 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
                     use LocalCallType::*;
                     match fct {
                         DirectCall(def_id) => CallType::DirectCall(*def_id),
-                        IndirectCall(def_id, local) => CallType::IndirectCall(*def_id, self.origins_from_local(*local)),
+                        // IndirectCall(def_id, local) => CallType::IndirectCall(*def_id, self.origins_from_local(*local)),
                         LocalFunctionPtr(local) => {
                             let origins = self.origins_from_local(*local);
                             if origins.len() == 1 {
@@ -673,72 +682,84 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
         .map(|(module_id, module)| (module, module_id))
         .collect();
 
-    eprintln!("strict digraph {{");
+    println!("strict digraph {{");
 
     for (module_name, module_id) in &modules {
-        eprintln!("    subgraph cluster{} {{", module_id);
+        println!("    subgraph cluster{} {{", module_id);
         if module_name.is_empty() {
             // it's the root of the crate
             // for crate_num is &tcx.crates() {
             //     let crate_name = tcx.crate_name(crate_num).to_ident_string();
             // }
             let crate_name = "crate_name"; // FIXME
-            eprintln!("        label = <<u>{}</u>>", crate_name);
-            eprintln!("        color = none");
+            println!("        label = <<u>{}</u>>", crate_name);
+            println!("        color = none");
         } else {
             // it's a normal module
-            eprintln!("        label = <<u>{}</u>>", module_name);
-            eprintln!("        color = green");
+            println!("        label = <<u>{}</u>>", module_name);
+            println!("        color = green");
         }
-        eprintln!("        fontcolor = green");
-        eprintln!();
+        println!("        fontcolor = green");
+        println!();
 
         // create function nodes
         for &function in &functions[module_name] {
             let name = tcx.def_path_str(function);
             // if monomorphized_functions.contains(&function) {
             //     // create virtual nodes for monomorphized call");
-            //     eprintln!("        \"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", name);
+            //     println!("        \"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", name);
             // } else {
-                eprintln!("        \"{}\" [shape=none]", name);
+                println!("        \"{}\" [shape=none]", name);
             // }
         }
 
 
-        eprintln!("    }}");
+        println!("    }}");
     }
 
-    eprintln!("\n    // dependency graph");
+    println!("\n    // dependency graph");
     for (caller, info) in dependencies {
-        let caller = tcx.def_path_str(caller);
+        let caller = get_generic_name(tcx, caller);
         for callee in &info.callees {
             use CallType::*;
             match &callee.function {
                 DirectCall(callee_id) => {
-                    let callee_str = tcx.def_path_str(*callee_id);
-                    eprintln!("    \"{}\" -> \"{}\"", caller, callee_str);
-                    // if depends_from_caller {
-                    //     eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, caller);
-                    // }
-                },
-                IndirectCall(callee_id, dependencies) => {
                     let callee = tcx.def_path_str(*callee_id);
-                    eprintln!("    \"{}\" -> \"{}\" // -> {:?}", caller, callee, dependencies);
-                    // eprintln!("    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name);
-                    // eprintln!("    \"{}\" -> \"{}\"", full_name, callee_str);
+                    if callee == "std::boxed::Box::<T>::new" {
+                        continue;
+                    }
+                    if callee == "std::ops::Deref::deref" {
+                        continue;
+                    }
+                    if callee == "std::ops::Fn::call" {
+                        continue;
+                    }
+                    if callee.starts_with("std::fmt::Arguments") {
+                        continue;
+                    }
+                    println!("    \"{}\" -> \"{}\"", caller, callee);
                     // if depends_from_caller {
-                    //     eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name);
-                    //     eprintln!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", full_name, caller);
+                    //     println!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee, caller);
                     // }
                 },
+                // IndirectCall(callee_id, dependencies) => {
+                //     let callee = tcx.def_path_str(*callee_id);
+                //     println!("    \"{}\" -> \"{}\" // -> {:?}", caller, callee, dependencies);
+                //     // println!("    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name);
+                //     // println!("    \"{}\" -> \"{}\"", full_name, callee_str);
+                //     // if depends_from_caller {
+                //     //     println!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name);
+                //     //     println!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", full_name, caller);
+                //     // }
+                // },
                 FromLocalPointer(ptrs) => {
                     for ptr in ptrs {
-                        eprintln!("    // \"{}\" -> \"{:?}\"", caller, ptr);
+                        println!("    // \"{}\" -> \"{:?}\"", caller, ptr);
                     }
                 },
             }
         }
     }
 
-    eprintln!("}}");
+    println!("}}");
 }
