@@ -121,6 +121,7 @@ pub fn call_trait_with_associated_type_inline(get_fct: impl WrapperTraitWithAsso
     get_fct.get_fct()()
 }
 
+/*
 pub fn call_from_multiple_local(random: bool) {
     let fct = if random {
         foo
@@ -174,7 +175,9 @@ pub fn call_from_multiple_return_of_other_function(random: bool) {
     };
     fct()
 }
+*/
 
+/*
 pub fn call_mixed_source<
     Fct: Fn(),
     GetFctTrait: Fn() -> Fct,
@@ -260,3 +263,4 @@ pub fn call_mixed_source<
     };
     fct()
 }
+*/
