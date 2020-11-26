@@ -576,75 +576,6 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
         })
         .collect();
 
-//  /////////////////////////////
-//
-//      let mut subfunctions = SearchFunctionCall::new(&depends_from_args);
-//      subfunctions.visit_body(mir);
-//
-//      let caller = caller.to_def_id();
-//      functions.insert(caller);
-//
-//      for (subfunction, depends_from_caller) in subfunctions.inner_functions {
-//          // TODO: take a look at
-//          // https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TyCtxt.html#method.upstream_monomorphizations_for
-//          let callee_id = if let rustc_middle::ty::FnDef(def_id, _) = subfunction.constant().unwrap().literal.ty.kind() {
-//              *def_id
-//          } else {
-//              unreachable!();
-//          };
-//          functions.insert(callee_id);
-//
-//          let callee_str = tcx.def_path_str(callee_id);
-//          let full_name = format!("{:?}", subfunction);
-//          let monomorphized_call = full_name != callee_str;
-//          if monomorphized_call {
-//              monomorphized_functions.insert((callee_id, full_name.clone()));
-//              dependencies.push((caller, Function::Monomorphized(callee_id, full_name, depends_from_caller)));
-//          } else {
-//              dependencies.push((caller, Function::Direct(callee_id, depends_from_caller)));
-//          }
-//      }
-//  }
-//
-//  // Group item by module
-//  // TODO: create a hierarchy of module
-//  let modules: HashSet<_> = functions
-//      .iter()
-//      .map(|&f| get_module(tcx, f))
-//      .collect();
-//  let modules: HashMap<String, usize> = modules
-//      .into_iter()
-//      .enumerate()
-//      .map(|(id, name)| (name, id))
-//      .collect();
-//
-//  let functions = {
-//      let mut _functions: HashMap<String, Vec<DefId>> = modules
-//          .iter()
-//          .map(|(name, _)| (name.clone(), Vec::new()))
-//          .collect();
-//      for function in functions {
-//          _functions.get_mut(&get_module(tcx, function)).unwrap().push(function);
-//      }
-//      for &(id, _) in &monomorphized_functions {
-//          _functions.get_mut(&get_module(tcx, id)).unwrap().push(id);
-//      }
-//      _functions
-//  };
-//
-//  let monomorphized_functions = {
-//      let mut _functions: HashMap<String, Vec<String>> = modules
-//          .iter()
-//          .map(|(name, _)| (name.clone(), Vec::new()))
-//          .collect();
-//      for (id, full_name) in monomorphized_functions {
-//          _functions.get_mut(&get_module(tcx, id)).unwrap().push(full_name);
-//      }
-//      _functions
-//  };
-//
-//  /////////////////////////////
-
     let functions: HashMap<Module, HashSet<DefId>> = {
         let mut functions: HashMap<Module, HashSet<DefId>> = default();
         for (&function, _) in &dependencies {
@@ -654,30 +585,8 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
         functions
     };
 
-    // // FIXME: this doesn't work
-    // let monomorphized_functions: HashSet<DefId> = dependencies
-    //     .iter()
-    //     .map(|(_, FunctionDependencies{callees, ..})| callees.iter())
-    //     .flatten()
-    //     .map(|callee| &callee.name)
-    //     .filter_map(|callee: &mir::Operand| {
-    //         let generic_name = format!("{:?}", callee);
-    //         callee
-    //             .constant()
-    //             .map(|cst| cst.check_static_ptr(tcx))
-    //             .flatten()
-    //             .map(|def_id| (tcx.def_path_str(def_id) != generic_name).then_some(def_id))
-    //             .flatten()
-    //     })
-    //     .collect();
-
-    // Group item by module
-    // TODO: create a hierarchy of module
     let modules: HashSet<&Module> = functions
         .keys()
-        .collect();
-    let modules: HashMap<&Module, usize> = modules
-        .into_iter()
         .enumerate()
         .map(|(module_id, module)| (module, module_id))
         .collect();
@@ -705,14 +614,8 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
         // create function nodes
         for &function in &functions[module_name] {
             let name = tcx.def_path_str(function);
-            // if monomorphized_functions.contains(&function) {
-            //     // create virtual nodes for monomorphized call");
-            //     println!("        \"{}\" [label=\"\"; fixedsize=\"false\"; width=0; height=0; shape=none]", name);
-            // } else {
-                println!("        \"{}\" [shape=none]", name);
-            // }
+            println!("        \"{}\" [shape=none]", name);
         }
-
 
         println!("    }}");
     }
