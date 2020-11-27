@@ -410,9 +410,9 @@ fn get_generic_name(tcx: ty::TyCtxt<'_>, def_id: DefId) -> String {
 
 /// Intraprocedural analysis that extract the relation between the arguments and the return value of
 /// both the function and all called functions.
-pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
+pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) -> HashMap<DefId, FunctionDependencies> {
     // let mut monomorphized_functions: HashSet<(DefId, String)> = default();
-    let dependencies: HashMap<DefId, FunctionDependencies> = tcx
+    tcx
         .body_owners()
         .map(|caller| {
             let mir = tcx.mir_built(ty::WithOptConstParam {
@@ -574,8 +574,15 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
                 callees,
             })
         })
-        .collect();
+        .collect()
+}
 
+pub fn render_dependencies<W: std::io::Write>(
+    tcx: ty::TyCtxt<'_>,
+    dependencies: HashMap<DefId, FunctionDependencies>,
+    output: &mut W)
+-> std::io::Result<()>
+{
     let functions: HashMap<Module, HashSet<DefId>> = {
         let mut functions: HashMap<Module, HashSet<DefId>> = default();
         for (&function, _) in &dependencies {
@@ -585,42 +592,41 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
         functions
     };
 
-    let modules: HashSet<&Module> = functions
+    let modules: HashMap<&Module, usize> = functions
         .keys()
         .enumerate()
         .map(|(module_id, module)| (module, module_id))
         .collect();
 
-    println!("strict digraph {{");
-
+    writeln!(output, "strict digraph {{")?;
     for (module_name, module_id) in &modules {
-        println!("    subgraph cluster{} {{", module_id);
+        writeln!(output, "    subgraph cluster{} {{", module_id)?;
         if module_name.is_empty() {
             // it's the root of the crate
             // for crate_num is &tcx.crates() {
             //     let crate_name = tcx.crate_name(crate_num).to_ident_string();
             // }
             let crate_name = "crate_name"; // FIXME
-            println!("        label = <<u>{}</u>>", crate_name);
-            println!("        color = none");
+            writeln!(output, "        label = <<u>{}</u>>", crate_name)?;
+            writeln!(output, "        color = none")?;
         } else {
             // it's a normal module
-            println!("        label = <<u>{}</u>>", module_name);
-            println!("        color = green");
+            writeln!(output, "        label = <<u>{}</u>>", module_name)?;
+            writeln!(output, "        color = green")?;
         }
-        println!("        fontcolor = green");
-        println!();
+        writeln!(output, "        fontcolor = green")?;
+        writeln!(output)?;
 
         // create function nodes
         for &function in &functions[module_name] {
             let name = tcx.def_path_str(function);
-            println!("        \"{}\" [shape=none]", name);
+            writeln!(output, "        \"{}\" [shape=none]", name)?;
         }
 
-        println!("    }}");
+        writeln!(output, "    }}")?;
     }
 
-    println!("\n    // dependency graph");
+    writeln!(output, "\n    // dependency graph")?;
     for (caller, info) in dependencies {
         let caller = get_generic_name(tcx, caller);
         for callee in &info.callees {
@@ -640,29 +646,30 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) {
                     if callee.starts_with("std::fmt::Arguments") {
                         continue;
                     }
-                    println!("    \"{}\" -> \"{}\"", caller, callee);
+                    writeln!(output, "    \"{}\" -> \"{}\"", caller, callee)?;
                     // if depends_from_caller {
-                    //     println!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee, caller);
+                    //     writeln!(output, "    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee, caller)?;
                     // }
                 },
                 // IndirectCall(callee_id, dependencies) => {
                 //     let callee = tcx.def_path_str(*callee_id);
-                //     println!("    \"{}\" -> \"{}\" // -> {:?}", caller, callee, dependencies);
-                //     // println!("    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name);
-                //     // println!("    \"{}\" -> \"{}\"", full_name, callee_str);
+                //     writeln!(output, "    \"{}\" -> \"{}\" // -> {:?}", caller, callee, dependencies)?;
+                //     // writeln!(output, "    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name)?;
+                //     // writeln!(output, "    \"{}\" -> \"{}\"", full_name, callee_str)?;
                 //     // if depends_from_caller {
-                //     //     println!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name);
-                //     //     println!("    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", full_name, caller);
+                //     //     writeln!(output, "    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name)?;
+                //     //     writeln!(output, "    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", full_name, caller)?;
                 //     // }
                 // },
                 FromLocalPointer(ptrs) => {
                     for ptr in ptrs {
-                        println!("    // \"{}\" -> \"{:?}\"", caller, ptr);
+                        writeln!(output, "    // \"{}\" -> \"{:?}\"", caller, ptr)?;
                     }
                 },
             }
         }
     }
 
-    println!("}}");
+    writeln!(output, "}}")?;
+    Ok(())
 }
