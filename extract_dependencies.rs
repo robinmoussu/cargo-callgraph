@@ -577,99 +577,109 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) -> HashMap<DefId, FunctionDepen
         .collect()
 }
 
+fn print_symbol(symbol: &Option<Symbol>) -> String {
+    symbol.map(|s| html_escape::encode_text(&s.to_ident_string()).to_string()).unwrap_or_else(|| String::from("_"))
+}
+
+
 pub fn render_dependencies<W: std::io::Write>(
     tcx: ty::TyCtxt<'_>,
-    dependencies: HashMap<DefId, FunctionDependencies>,
+    all_dependencies: HashMap<DefId, FunctionDependencies>,
     output: &mut W)
 -> std::io::Result<()>
 {
-    let functions: HashMap<Module, HashSet<DefId>> = {
-        let mut functions: HashMap<Module, HashSet<DefId>> = default();
-        for (&function, _) in &dependencies {
-            let module = get_module(tcx, function);
-            functions.entry(module).or_default().insert(function);
-        }
-        functions
-    };
+    writeln!(output, "digraph {{")?;
+    writeln!(output, "    node [ shape=none ]")?;
+    writeln!(output)?;
+    for (subgraph_id, (caller, dependencies)) in all_dependencies.iter().enumerate() {
+        let caller_name = tcx.def_path_str(*caller);
+        let escaped_caller_name = html_escape::encode_text(&caller_name);
 
-    let modules: HashMap<&Module, usize> = functions
-        .keys()
-        .enumerate()
-        .map(|(module_id, module)| (module, module_id))
-        .collect();
+        // TODO: add grouping by module?
 
-    writeln!(output, "strict digraph {{")?;
-    for (module_name, module_id) in &modules {
-        writeln!(output, "    subgraph cluster{} {{", module_id)?;
-        if module_name.is_empty() {
-            // it's the root of the crate
-            // for crate_num is &tcx.crates() {
-            //     let crate_name = tcx.crate_name(crate_num).to_ident_string();
-            // }
-            let crate_name = "crate_name"; // FIXME
-            writeln!(output, "        label = <<u>{}</u>>", crate_name)?;
-            writeln!(output, "        color = none")?;
-        } else {
-            // it's a normal module
-            writeln!(output, "        label = <<u>{}</u>>", module_name)?;
-            writeln!(output, "        color = green")?;
-        }
-        writeln!(output, "        fontcolor = green")?;
+        writeln!(output, "    subgraph cluster_{:03} {{", subgraph_id)?;
+        writeln!(output, "        color=grey")?;
         writeln!(output)?;
-
-        // create function nodes
-        for &function in &functions[module_name] {
-            let name = tcx.def_path_str(function);
-            writeln!(output, "        \"{}\" [shape=none]", name)?;
+        writeln!(output, "        \"{}\" [label=<<table border=\"0\" cellpadding=\"2\" cellspacing=\"0\" cellborder=\"0\"><tr>", caller_name)?;
+        writeln!(output, "            <td port=\"fct\"><font color='red'>{}</font></td>", escaped_caller_name)?;
+        // writeln!(output, "            <td>&lt;</td>")?;
+        // writeln!(output, "            <td><font color='darkgreen'>Fct</font>: Fn()</td>")?;
+        // writeln!(output, "            <td>&gt;</td>")?;
+        writeln!(output, "            <td>(</td>")?;
+        for (local, (symbol, ty)) in dependencies.arguments_name_and_type.iter_enumerated().skip(1) {
+            let port = local.as_usize();
+            let symbol = print_symbol(symbol);
+            let ty: ty::subst::GenericArg = (*ty).into();
+            let ty = format!("{}", ty);
+            let ty = html_escape::encode_text(&ty);
+            writeln!(output, "            <td port=\"{}\">{}: <font color='darkgreen'>{}</font></td>", port, symbol, ty)?;
         }
-
+        writeln!(output, "            <td>)</td>")?;
+        let (symbol, ty) = dependencies.arguments_name_and_type[mir::Local::from_usize(0)];
+        if !ty.is_unit() {
+            let symbol = print_symbol(&symbol);
+            writeln!(output, "            <td>&#8594;</td>")?;
+            writeln!(output, "            <td port=\"0\"><font color='darkgreen'>{}</font></td>", symbol)?;
+        }
+        writeln!(output, "            </tr></table>>")?;
+        writeln!(output, "        ]")?;
+        writeln!(output, "        {{")?;
+        writeln!(output, "            rank=same")?;
+        for callee in dependencies.callees.iter() {
+            use CallType::*;
+            match callee.function {
+                DirectCall(def_id) => {
+                    let callee_name = tcx.def_path_str(def_id);
+                    writeln!(output, "            \"{} to {}\" [ style=filled label=\"\" width=0.2; height=0.2; shape=circle ]", caller_name, callee_name)?;
+                },
+                FromLocalPointer(_) => {
+                    // TODO
+                    ()
+                }
+            }
+        }
+        for (subgraph_id, (ancestor, ancestor_dependencies)) in all_dependencies.iter().enumerate() {
+            let ancestor_name = tcx.def_path_str(*ancestor);
+            for ancestor_callee in ancestor_dependencies.callees.iter() {
+                use CallType::*;
+                match ancestor_callee.function {
+                    DirectCall(def_id) => {
+                        if tcx.def_path_str(def_id) == caller_name {
+                            writeln!(output, "            \"{} from {}\" [ label=\"\" width=0.2; height=0.2; shape=circle ]", caller_name, ancestor_name)?;
+                        }
+                    },
+                    FromLocalPointer(_) => {
+                        // TODO
+                        ()
+                    }
+                }
+            }
+        }
+        writeln!(output, "        }}")?;
         writeln!(output, "    }}")?;
     }
+    writeln!(output)?;
 
-    writeln!(output, "\n    // dependency graph")?;
-    for (caller, info) in dependencies {
-        let caller = get_generic_name(tcx, caller);
-        for callee in &info.callees {
+    for (subgraph_id, (caller, dependencies)) in all_dependencies.iter().enumerate() {
+        let caller_name = tcx.def_path_str(*caller);
+        for callee in &dependencies.callees {
             use CallType::*;
-            match &callee.function {
-                DirectCall(callee_id) => {
-                    let callee = tcx.def_path_str(*callee_id);
-                    if callee == "std::boxed::Box::<T>::new" {
-                        continue;
-                    }
-                    if callee == "std::ops::Deref::deref" {
-                        continue;
-                    }
-                    if callee == "std::ops::Fn::call" {
-                        continue;
-                    }
-                    if callee.starts_with("std::fmt::Arguments") {
-                        continue;
-                    }
-                    writeln!(output, "    \"{}\" -> \"{}\"", caller, callee)?;
-                    // if depends_from_caller {
-                    //     writeln!(output, "    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee, caller)?;
-                    // }
+            match callee.function {
+                DirectCall(def_id) => {
+                    let callee_name = tcx.def_path_str(def_id);
+                    writeln!(output, "    \"{} to {}\" -> \"{} from {}\" [ color=\"black:invis:black\" arrowhead=empty ]", caller_name, callee_name, callee_name, caller_name);
+                    // I don't think it's needed to have that invisible edge
+                    // writeln!(output, "    \"{}\" -> \"{} from {}\" [ style=invis ]", caller_name, callee_name, caller_name)?;
                 },
-                // IndirectCall(callee_id, dependencies) => {
-                //     let callee = tcx.def_path_str(*callee_id);
-                //     writeln!(output, "    \"{}\" -> \"{}\" // -> {:?}", caller, callee, dependencies)?;
-                //     // writeln!(output, "    \"{}\" -> \"{}\" [arrowhead=none]", caller, full_name)?;
-                //     // writeln!(output, "    \"{}\" -> \"{}\"", full_name, callee_str)?;
-                //     // if depends_from_caller {
-                //     //     writeln!(output, "    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", callee_str, full_name)?;
-                //     //     writeln!(output, "    \"{}\" -> \"{}\" [style=dotted; constraint=false; arrowhead=none]", full_name, caller)?;
-                //     // }
-                // },
-                FromLocalPointer(ptrs) => {
-                    for ptr in ptrs {
-                        writeln!(output, "    // \"{}\" -> \"{:?}\"", caller, ptr)?;
-                    }
-                },
+                FromLocalPointer(_) => {
+                    // TODO
+                    ()
+                }
             }
         }
     }
 
     writeln!(output, "}}")?;
+
     Ok(())
 }
