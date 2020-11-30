@@ -407,6 +407,20 @@ fn extract_function_call<'tcx>(tcx: ty::TyCtxt<'tcx>, mir: &mir::Body<'tcx>) -> 
 //     }
 // }
 
+fn extract_arguments(mir: &'tcx mir::Body) -> Vec<SymbolAndType<'tcx>> {
+    mir.args_iter()
+        .map(|arg| {
+            let symbol = mir
+                .var_debug_info
+                .iter()
+                .find(|debug| debug.place.local == arg)
+                .map(|debug| debug.name);
+            let ty = mir.local_decls[arg].ty;
+            SymbolAndType{symbol, ty}
+        })
+        .collect()
+}
+
 /// Intraprocedural analysis that extract the relation between the arguments and the return value of
 /// both the function and all called functions.
 pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) -> HashMap<DefId, FunctionDependencies<'_>> {
@@ -576,21 +590,63 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) -> HashMap<DefId, FunctionDepen
         .collect()
 }
 
+pub struct SymbolAndType<'tcx> {
+    symbol: Option<Symbol>,
+    ty: ty::Ty<'tcx>,
+}
+
+pub enum Source {
+    FunctionId(DefId), // when taking a reference to another function
+    Argument(mir::Local), // argument of the caller
+    ReturnVariable(DefId), // return variable of another callee
+}
+pub struct CallerDependency {
+    sources: Vec<Source>,
+    callee: DefId,
+}
+pub struct CalleeDependency {
+    called_by: DefId,
+    targets: Vec<mir::Local>, // argument
+}
+struct ReturnDependency {
+    source: Source,
+}
+
+pub struct Function<'tcx> { // subgraph (crate local + external functions)
+    return_ty: ty::Ty<'tcx>,
+    arguments: Vec<SymbolAndType<'tcx>>,
+    caller_deps: Vec<CallerDependency>, // small blue arrows to a grey circle
+    callee_deps: Vec<CalleeDependency>, // small blue arrows from a white circle
+    return_deps: Vec<ReturnDependency>, // small blue arrows to the return value
+}
+
+pub struct AllDependencies<'tcx> {
+    // crate_name: rustc_middle::DefId, // or maybe a Symbol
+    // NOTE: Do not forget to add externally defined functions
+    functions: HashMap<DefId, Function<'tcx>>, // calleer -> callsite
+}
+
 fn print_symbol(symbol: &Option<Symbol>) -> String {
     symbol.map(|s| html_escape::encode_text(&s.to_ident_string()).to_string()).unwrap_or_else(|| String::from("_"))
 }
 
-
-pub fn render_dependencies<W: std::io::Write>(
-    tcx: ty::TyCtxt<'_>,
-    all_dependencies: HashMap<DefId, FunctionDependencies<'_>>,
+pub fn render_dependencies<'tcx, W: std::io::Write>(
+    tcx: ty::TyCtxt<'tcx>,
+    all_dependencies: AllDependencies<'tcx>,
     output: &mut W)
 -> std::io::Result<()>
 {
     writeln!(output, "digraph {{")?;
+    //let crate_name = tcx.def_path_str(all_dependencies.crate_name);
+    // writeln!(output, "digraph {} {{", crate_name)?;
     writeln!(output, "    node [ shape=none ]")?;
     writeln!(output)?;
-    for (subgraph_id, (caller, dependencies)) in all_dependencies.iter().enumerate() {
+    for (subgraph_id, (caller, function)) in all_dependencies
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(id, fct)| (id + 1, fct)) // arguments id starts from 1
+    {
         let caller_name = tcx.def_path_str(*caller);
         let escaped_caller_name = html_escape::encode_text(&caller_name);
 
@@ -600,80 +656,85 @@ pub fn render_dependencies<W: std::io::Write>(
         writeln!(output, "        color=grey")?;
         writeln!(output)?;
         writeln!(output, "        \"{}\" [label=<<table border=\"0\" cellpadding=\"2\" cellspacing=\"0\" cellborder=\"0\"><tr>", caller_name)?;
-        writeln!(output, "            <td port=\"fct\"><font color='red'>{}</font></td>", escaped_caller_name)?;
+        writeln!(output, "            <td port=\"function\"><font color='red'>{}</font></td>", escaped_caller_name)?;
         // writeln!(output, "            <td>&lt;</td>")?;
         // writeln!(output, "            <td><font color='darkgreen'>Fct</font>: Fn()</td>")?;
         // writeln!(output, "            <td>&gt;</td>")?;
         writeln!(output, "            <td>(</td>")?;
-        for (local, (symbol, ty)) in dependencies.arguments_name_and_type.iter_enumerated().skip(1) {
-            let port = local.as_usize();
+        for (arg_id, SymbolAndType{symbol, ty}) in function.arguments.iter().enumerate() {
             let symbol = print_symbol(symbol);
             let ty: ty::subst::GenericArg<'_> = (*ty).into();
             let ty = format!("{}", ty);
             let ty = html_escape::encode_text(&ty);
-            writeln!(output, "            <td port=\"{}\">{}: <font color='darkgreen'>{}</font></td>", port, symbol, ty)?;
+            writeln!(output, "            <td port=\"{}\">{}: <font color='darkgreen'>{}</font></td>", arg_id, symbol, ty)?;
         }
         writeln!(output, "            <td>)</td>")?;
-        let (symbol, ty) = dependencies.arguments_name_and_type[mir::Local::from_usize(0)];
-        if !ty.is_unit() {
-            let symbol = print_symbol(&symbol);
+        if !function.return_ty.is_unit() {
+            let ty: ty::subst::GenericArg<'_> = function.return_ty.into();
+            let ty = format!("{}", ty);
+            let ty = html_escape::encode_text(&ty);
             writeln!(output, "            <td>&#8594;</td>")?;
-            writeln!(output, "            <td port=\"0\"><font color='darkgreen'>{}</font></td>", symbol)?;
+            writeln!(output, "            <td port=\"return\"><font color='darkgreen'>{}</font></td>", ty)?;
         }
         writeln!(output, "            </tr></table>>")?;
         writeln!(output, "        ]")?;
         writeln!(output, "        {{")?;
         writeln!(output, "            rank=same")?;
-        for callee in dependencies.callees.iter() {
-            use CallType::*;
-            match callee.function {
-                DirectCall(def_id) => {
-                    let callee_name = tcx.def_path_str(def_id);
-                    writeln!(output, "            \"{} to {}\" [ style=filled label=\"\" width=0.2; height=0.2; shape=circle ]", caller_name, callee_name)?;
-                },
-                FromLocalPointer(_) => {
-                    // TODO
-                    ()
-                }
-            }
+        for CallerDependency{callee, ..} in function.caller_deps.iter() {
+            let callee_name = tcx.def_path_str(*callee);
+            writeln!(output, "            \"{} to {}\" [ style=filled label=\"\" width=0.2; height=0.2; shape=circle ]", caller_name, callee_name)?;
         }
-        for (_subgraph_id, (ancestor, ancestor_dependencies)) in all_dependencies.iter().enumerate() {
-            let ancestor_name = tcx.def_path_str(*ancestor);
-            for ancestor_callee in ancestor_dependencies.callees.iter() {
-                use CallType::*;
-                match ancestor_callee.function {
-                    DirectCall(def_id) => {
-                        if tcx.def_path_str(def_id) == caller_name {
-                            writeln!(output, "            \"{} from {}\" [ label=\"\" width=0.2; height=0.2; shape=circle ]", caller_name, ancestor_name)?;
-                        }
-                    },
-                    FromLocalPointer(_) => {
-                        // TODO
-                        ()
-                    }
-                }
-            }
+        for CalleeDependency{called_by, ..} in function.callee_deps.iter() {
+            let called_by_name = tcx.def_path_str(*called_by);
+            writeln!(output, "            \"{} from {}\" [ label=\"\" width=0.2; height=0.2; shape=circle ]", caller_name, called_by_name)?;
         }
         writeln!(output, "        }}")?;
         writeln!(output, "    }}")?;
     }
     writeln!(output)?;
 
-    for (_subgraph_id, (caller, dependencies)) in all_dependencies.iter().enumerate() {
+    for (subgraph_id, (caller, function)) in all_dependencies.functions.iter().enumerate() {
         let caller_name = tcx.def_path_str(*caller);
-        for callee in &dependencies.callees {
-            use CallType::*;
-            match callee.function {
-                DirectCall(def_id) => {
-                    let callee_name = tcx.def_path_str(def_id);
-                    writeln!(output, "    \"{} to {}\" -> \"{} from {}\" [ color=\"black:invis:black\" arrowhead=empty ]", caller_name, callee_name, callee_name, caller_name)?;
-                    // I don't think it's needed to have that invisible edge
-                    // writeln!(output, "    \"{}\" -> \"{} from {}\" [ style=invis ]", caller_name, callee_name, caller_name)?;
-                },
-                FromLocalPointer(_) => {
-                    // TODO
-                    ()
+        for CallerDependency{sources, callee} in function.caller_deps.iter() {
+            let callee_name = tcx.def_path_str(*callee);
+            for source in sources {
+                use Source::*;
+                match source {
+                    FunctionId(source) => {
+                        let source_name = tcx.def_path_str(*source);
+                        writeln!(output, "    \"{}\":function -> \"{} to {}\"  [ color=\"blue\" arrowtail=empty ]", source_name, caller_name, callee_name);
+                    },
+                    Argument(arg) => {
+                        writeln!(output, "    \"{}\":{} -> \"{} to {}\"  [ color=\"blue\" arrowtail=empty ]", caller_name, arg.as_usize(), caller_name, callee_name);
+                    },
+                    ReturnVariable(previous_callee) => {
+                        let previous_callee_name = tcx.def_path_str(*previous_callee);
+                        writeln!(output, "    \"{} to {}\" -> \"{} to {}\"  [ color=\"blue\" arrowtail=empty ]", caller_name, previous_callee_name, caller_name, callee_name);
+                    },
                 }
+            }
+            writeln!(output, "    \"{} to {}\" -> \"{} from {}\" [ color=\"black:invis:black\" arrowhead=empty ]", caller_name, callee_name, callee_name, caller_name)?;
+        }
+        for CalleeDependency{called_by, targets} in function.callee_deps.iter() {
+            let called_by_name = tcx.def_path_str(*called_by);
+            for target in targets {
+                writeln!(output, "    \"{} from {}\" -> \"{}\":{}  [ color=\"blue\" arrowtail=empty ]", caller_name, called_by_name, caller_name, target.as_usize());
+            }
+        }
+        for ReturnDependency{source} in function.return_deps.iter() {
+            use Source::*;
+            match source {
+                FunctionId(source) => {
+                    let source_name = tcx.def_path_str(*source);
+                    writeln!(output, "    \"{}\":function -> \"{}\":return  [ color=\"blue\" arrowtail=empty ]", source_name, caller_name);
+                },
+                Argument(arg) => {
+                    writeln!(output, "    \"{}\":{} -> \"{}\":return  [ color=\"blue\" arrowtail=empty ]", caller_name, arg.as_usize(), caller_name);
+                },
+                ReturnVariable(previous_callee) => {
+                    let previous_callee_name = tcx.def_path_str(*previous_callee);
+                    writeln!(output, "    \"{} to {}\" -> \"{}\":return  [ color=\"blue\" arrowtail=empty ]", caller_name, previous_callee_name, caller_name);
+                },
             }
         }
     }

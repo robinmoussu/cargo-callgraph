@@ -494,16 +494,6 @@ fn run_global_ctxt(
     render_options: RenderOptions,
     output_format: Option<OutputFormat>,
 ) -> (clean::Crate, RenderInfo, RenderOptions) {
-    tcx.sess.time("build_call_graph", || {
-        let dependencies = extract_dependencies(tcx);
-        let filename = "example2.dot";
-        let mut output = std::fs::File::create(filename).unwrap();
-        if let Err(err) = render_dependencies(tcx, dependencies, &mut output) {
-            eprintln!("Error when writing dependencies to {}: {}", filename, err);
-        }
-    });
-
-
     let access_levels = tcx.privacy_access_levels(LOCAL_CRATE);
     // Convert from a HirId set to a DefId set since we don't always have easy access
     // to the map from defid -> hirid
@@ -542,6 +532,16 @@ fn run_global_ctxt(
         module_trait_cache: RefCell::new(FxHashMap::default()),
     };
     debug!("crate: {:?}", tcx.hir().krate());
+
+    tcx.sess.time("build_call_graph", || {
+        let dependencies = extract_dependencies(tcx);
+        let filename = "/home/robin/dev/cargo-callgraph/example2.dot";
+        let mut output = std::fs::File::create(filename).expect("cannot create output file");
+        if let Err(err) = render_dependencies(tcx, dependencies, &mut output) {
+            eprintln!("Error when writing dependencies to {}: {}", filename, err);
+        }
+    });
+
 
     let krate = tcx.sess.time("clean_crate", || clean::krate(&mut ctxt));
     ctxt.sess().abort_if_errors();
