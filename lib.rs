@@ -2,6 +2,7 @@
     html_root_url = "https://doc.rust-lang.org/nightly/",
     html_playground_url = "https://play.rust-lang.org/"
 )]
+#![allow(dead_code)]
 #![feature(array_methods)]
 #![feature(bool_to_option)]
 #![feature(box_patterns)]

@@ -1,5 +1,4 @@
 use bit_vec::BitVec;
-use itertools::Itertools;
 use rustc_hir::def;
 use rustc_hir::def_id::DefId;
 use rustc_index::vec::IndexVec;
@@ -103,7 +102,7 @@ fn direct_dependencies<'mir, 'tcx>(mir: &'mir mir::Body<'tcx>) -> Dependencies<'
     // The index of a dependency to a constant is its index in `constants` shifted by
     // `locals_count`.
     let locals_count = mir.local_decls.len();
-    let constants: Vec<ty::Const> = extract_constant(mir).into_iter().collect();
+    let constants: Vec<ty::Const<'_>> = extract_constant(mir).into_iter().collect();
     let mut dependencies = IndexVec::from_elem_n(
         BitVec::from_elem(locals_count + constants.len(), false),
         locals_count);
@@ -271,11 +270,11 @@ fn propagate_dependencies<'tcx>(deps: Dependencies<'tcx>) -> Dependencies<'tcx> 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Hash)]
 struct Module(String);
 
-impl Module {
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
+// impl Module {
+//     pub fn is_empty(&self) -> bool {
+//         self.0.is_empty()
+//     }
+// }
 
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -283,40 +282,40 @@ impl fmt::Display for Module {
     }
 }
 
-/// Return the name of the module of a given function
-fn get_module(tcx: ty::TyCtxt<'_>, function: DefId) -> Module {
-    use ty::DefIdTree;
-
-    let mut current = function;
-    // The immediate parent might not always be a module.
-    // Find the first parent which is.
-    let module = loop {
-        if let Some(parent) = tcx.parent(current) {
-            if tcx.def_kind(parent) == rustc_hir::def::DefKind::Mod {
-                break Some(parent);
-            }
-            current = parent;
-        } else {
-            debug!(
-                "{:?} has no parent (kind={:?}, original was {:?})",
-                current,
-                tcx.def_kind(current),
-                function
-            );
-            break None;
-        }
-    }.unwrap();
-
-
-    let def_path = tcx.def_path(module);
-    let mut crate_name = tcx.original_crate_name(def_path.krate).to_ident_string();
-    if crate_name == "main" {
-        crate_name = String::new();
-    } else {
-        crate_name += "::";
-    }
-    Module(crate_name + &def_path.data.iter().map(|m| format!("{}", m)).join("::"))
-}
+// /// Return the name of the module of a given function
+// fn get_module(tcx: ty::TyCtxt<'_>, function: DefId) -> Module {
+//     use ty::DefIdTree;
+// 
+//     let mut current = function;
+//     // The immediate parent might not always be a module.
+//     // Find the first parent which is.
+//     let module = loop {
+//         if let Some(parent) = tcx.parent(current) {
+//             if tcx.def_kind(parent) == rustc_hir::def::DefKind::Mod {
+//                 break Some(parent);
+//             }
+//             current = parent;
+//         } else {
+//             debug!(
+//                 "{:?} has no parent (kind={:?}, original was {:?})",
+//                 current,
+//                 tcx.def_kind(current),
+//                 function
+//             );
+//             break None;
+//         }
+//     }.unwrap();
+// 
+// 
+//     let def_path = tcx.def_path(module);
+//     let mut crate_name = tcx.original_crate_name(def_path.krate).to_ident_string();
+//     if crate_name == "main" {
+//         crate_name = String::new();
+//     } else {
+//         crate_name += "::";
+//     }
+//     Module(crate_name + &def_path.data.iter().map(|m| format!("{}", m)).join("::"))
+// }
 
 #[derive(Clone, Debug)]
 enum LocalCallType {
@@ -399,18 +398,18 @@ fn extract_function_call<'tcx>(tcx: ty::TyCtxt<'tcx>, mir: &mir::Body<'tcx>) -> 
     search_callees.callees
 }
 
-fn get_generic_name(tcx: ty::TyCtxt<'_>, def_id: DefId) -> String {
-    match tcx.opt_associated_item(def_id) {
-        Some(ty::AssocItem{def_id, ..}) => {
-            tcx.def_path_str(*def_id)
-        },
-        None => tcx.def_path_str(def_id),
-    }
-}
+// fn get_generic_name(tcx: ty::TyCtxt<'_>, def_id: DefId) -> String {
+//     match tcx.opt_associated_item(def_id) {
+//         Some(ty::AssocItem{def_id, ..}) => {
+//             tcx.def_path_str(*def_id)
+//         },
+//         None => tcx.def_path_str(def_id),
+//     }
+// }
 
 /// Intraprocedural analysis that extract the relation between the arguments and the return value of
 /// both the function and all called functions.
-pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) -> HashMap<DefId, FunctionDependencies> {
+pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) -> HashMap<DefId, FunctionDependencies<'_>> {
     // let mut monomorphized_functions: HashSet<(DefId, String)> = default();
     tcx
         .body_owners()
@@ -421,10 +420,10 @@ pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) -> HashMap<DefId, FunctionDepen
             });
             let mir = mir.borrow();
 
-            let callsites: Vec<CallSite> = extract_function_call(tcx, &mir);
+            let callsites: Vec<CallSite<'_>> = extract_function_call(tcx, &mir);
 
             // Note: arguments[0] == return type, then it's the arguments of the function
-            let arguments_name_and_type: IndexVec<mir::Local, (Option<Symbol>, ty::Ty)> = (0..=mir.arg_count)
+            let arguments_name_and_type: IndexVec<mir::Local, (Option<Symbol>, ty::Ty<'_>)> = (0..=mir.arg_count)
                 .map(mir::Local::from_usize)
                 .map(|arg| {
                     let name = mir.var_debug_info
@@ -584,7 +583,7 @@ fn print_symbol(symbol: &Option<Symbol>) -> String {
 
 pub fn render_dependencies<W: std::io::Write>(
     tcx: ty::TyCtxt<'_>,
-    all_dependencies: HashMap<DefId, FunctionDependencies>,
+    all_dependencies: HashMap<DefId, FunctionDependencies<'_>>,
     output: &mut W)
 -> std::io::Result<()>
 {
@@ -609,7 +608,7 @@ pub fn render_dependencies<W: std::io::Write>(
         for (local, (symbol, ty)) in dependencies.arguments_name_and_type.iter_enumerated().skip(1) {
             let port = local.as_usize();
             let symbol = print_symbol(symbol);
-            let ty: ty::subst::GenericArg = (*ty).into();
+            let ty: ty::subst::GenericArg<'_> = (*ty).into();
             let ty = format!("{}", ty);
             let ty = html_escape::encode_text(&ty);
             writeln!(output, "            <td port=\"{}\">{}: <font color='darkgreen'>{}</font></td>", port, symbol, ty)?;
@@ -638,7 +637,7 @@ pub fn render_dependencies<W: std::io::Write>(
                 }
             }
         }
-        for (subgraph_id, (ancestor, ancestor_dependencies)) in all_dependencies.iter().enumerate() {
+        for (_subgraph_id, (ancestor, ancestor_dependencies)) in all_dependencies.iter().enumerate() {
             let ancestor_name = tcx.def_path_str(*ancestor);
             for ancestor_callee in ancestor_dependencies.callees.iter() {
                 use CallType::*;
@@ -660,14 +659,14 @@ pub fn render_dependencies<W: std::io::Write>(
     }
     writeln!(output)?;
 
-    for (subgraph_id, (caller, dependencies)) in all_dependencies.iter().enumerate() {
+    for (_subgraph_id, (caller, dependencies)) in all_dependencies.iter().enumerate() {
         let caller_name = tcx.def_path_str(*caller);
         for callee in &dependencies.callees {
             use CallType::*;
             match callee.function {
                 DirectCall(def_id) => {
                     let callee_name = tcx.def_path_str(def_id);
-                    writeln!(output, "    \"{} to {}\" -> \"{} from {}\" [ color=\"black:invis:black\" arrowhead=empty ]", caller_name, callee_name, callee_name, caller_name);
+                    writeln!(output, "    \"{} to {}\" -> \"{} from {}\" [ color=\"black:invis:black\" arrowhead=empty ]", caller_name, callee_name, callee_name, caller_name)?;
                     // I don't think it's needed to have that invisible edge
                     // writeln!(output, "    \"{}\" -> \"{} from {}\" [ style=invis ]", caller_name, callee_name, caller_name)?;
                 },
