@@ -423,171 +423,238 @@ fn extract_arguments(mir: &'tcx mir::Body) -> Vec<SymbolAndType<'tcx>> {
 
 /// Intraprocedural analysis that extract the relation between the arguments and the return value of
 /// both the function and all called functions.
-pub fn extract_dependencies(tcx: ty::TyCtxt<'_>) -> HashMap<DefId, FunctionDependencies<'_>> {
-    // let mut monomorphized_functions: HashSet<(DefId, String)> = default();
-    tcx
+pub fn extract_and_render_dependencies<'tcx, W: std::io::Write>(tcx: ty::TyCtxt<'tcx>, output: &mut W) -> std::io::Result<()>
+{
+    // EXTRACT
+
+    let functions: Vec<_> = tcx
         .body_owners()
-        .map(|caller| {
+        .map(|function| {
             let mir = tcx.mir_built(ty::WithOptConstParam {
-                did: caller,
-                const_param_did: tcx.opt_const_param_of(caller)
+                did: function,
+                const_param_did: tcx.opt_const_param_of(function)
             });
-            let mir = mir.borrow();
+            (mir.borrow(), function.to_def_id())
+        })
+        .collect();
+    let functions: Vec<(&'_ mir::Body, DefId)> = functions
+        .iter()
+        .map(|(mir, caller)| {
+            let mir: &mir::Body = &mir;
+            (mir, *caller)
+        })
+        .collect();
 
-            let callsites: Vec<CallSite<'_>> = extract_function_call(tcx, &mir);
+    let mut all_dependencies: HashMap<DefId, Function<'_>> = HashMap::new();
 
-            // Note: arguments[0] == return type, then it's the arguments of the function
-            let arguments_name_and_type: IndexVec<mir::Local, (Option<Symbol>, ty::Ty<'_>)> = (0..=mir.arg_count)
-                .map(mir::Local::from_usize)
-                .map(|arg| {
-                    let name = mir.var_debug_info
-                        .iter()
-                        .find(|debug| debug.place.local == arg)
-                        .map(|debug| debug.name);
-                    let ty = mir.local_decls[arg].ty;
-                    (name, ty)
-                })
-                .collect();
+    for (mir, caller) in functions.iter() {
+        let return_ty = mir.local_decls[mir::Local::from_usize(0)].ty;
+        let arguments = extract_arguments(&mir);
+        let function = all_dependencies.entry(*caller).or_insert_with(|| Function {
+            return_ty,
+            arguments,
+            caller_deps: Vec::new(),
+            callee_deps: Vec::new(),
+            return_deps: Vec::new(),
+        });
 
-            let deps = direct_dependencies(&mir);
-            let deps = propagate_dependencies(deps);
+        let deps = direct_dependencies(&mir);
+        let deps = propagate_dependencies(deps);
 
-            struct XXX<'mir, 'deps, 'tcx> {
-                mir: &'mir mir::Body<'tcx>,
-                deps: &'deps Dependencies<'tcx>,
-                // callsites: &'callsites Vec<CallSite<'tcx>>,
-                is_return_variable: BitVec,
-            }
-            impl<'mir, 'deps, 'tcx> XXX<'mir, 'deps, 'tcx> {
-                pub fn new(mir: &'mir mir::Body<'tcx>, deps: &'deps Dependencies<'tcx>, callsites: &Vec<CallSite<'tcx>>) -> Self {
-                    let mut is_return_variable = BitVec::from_elem(deps.locals_count + deps.constants.len(), false);
-                    is_return_variable.set(0, true);
-                    for callsite in callsites {
-                        if let Some(ret) = callsite.return_variable {
-                            is_return_variable.set(ret.as_usize(), true);
+        let callsites: Vec<CallSite<'_>> = extract_function_call(tcx, &mir);
+        for callsite in &callsites {
+            use LocalCallType::*;
+            match callsite.function {
+                DirectCall(callee) => {
+                    let mut sources: Vec<Source<'_>> = Vec::new();
+                    for arg in &callsite.arguments {
+                        use mir::Operand::*;
+                        match arg {
+                            Copy(place) | Move(place) => {
+                                for (local, depends_from) in deps.dependencies[place.local].iter().enumerate() {
+                                     if !depends_from {
+                                         continue;
+                                     }
+
+                                     if local <= mir.arg_count {
+                                         sources.push(Source::Argument(mir::Local::from_usize(local)));
+                                     } else if local < deps.locals_count { // FIXME: off by 1 error ?
+                                         // note: dependencies to local variable are ignored
+                                         let local = mir::Local::from_usize(local);
+                                         for callsite in &callsites {
+                                             if callsite.return_variable == Some(local) {
+                                                 if let DirectCall(callee) = callsite.function {
+                                                     sources.push(Source::ReturnVariable(callee));
+                                                     break;
+                                                 } else {
+                                                     panic!();
+                                                 }
+                                             }
+                                         }
+                                     } else {
+                                         sources.push(Source::FunctionId(deps.constants[local - deps.locals_count]));
+                                     }
+                                }
+                            },
+                            Constant(cst) => {
+                                sources.push(Source::FunctionId(*cst.literal));
+                            }
                         }
                     }
 
-                    XXX {
-                        mir,
-                        deps,
-                        // callsites,
-                        is_return_variable,
+                    function.caller_deps.push(CallerDependency {
+                        sources,
+                        callee,
+                    });
+                },
+                LocalFunctionPtr(local) => {
+                    let _ =local;
+                    // TODO
+                },
+            }
+        }
+
+
+        /*
+        struct XXX<'mir, 'deps, 'tcx> {
+            mir: &'mir mir::Body<'tcx>,
+            deps: &'deps Dependencies<'tcx>,
+            // callsites: &'callsites Vec<CallSite<'tcx>>,
+            is_return_variable: BitVec,
+        }
+        impl<'mir, 'deps, 'tcx> XXX<'mir, 'deps, 'tcx> {
+            pub fn new(mir: &'mir mir::Body<'tcx>, deps: &'deps Dependencies<'tcx>, callsites: &Vec<CallSite<'tcx>>) -> Self {
+                let mut is_return_variable = BitVec::from_elem(deps.locals_count + deps.constants.len(), false);
+                is_return_variable.set(0, true);
+                for callsite in callsites {
+                    if let Some(ret) = callsite.return_variable {
+                        is_return_variable.set(ret.as_usize(), true);
                     }
                 }
 
-                // The source of all locals, are:
-                //  - the arguments to the current function
-                //  - constants
-                //  - the return value of called functions
-                fn is_argument(&self, idx: usize) -> bool {
-                    // + 1 for the return value of the function
-                    0 < idx && idx < self.mir.arg_count + 1
+                XXX {
+                    mir,
+                    deps,
+                    // callsites,
+                    is_return_variable,
                 }
-                fn is_constant(&self, idx: usize) -> bool {
-                    idx >= self.deps.locals_count
-                }
-                fn is_return_variable(&self, idx: usize) -> bool {
-                    self.is_return_variable[idx]
-                }
+            }
 
-                // fn is_callable(ty: ty::Ty) -> bool {
-                //     ty.is_fn() || ty.is_fn_ptr() || ty.is_closure()
-                // }
+            // The source of all locals, are:
+            //  - the arguments to the current function
+            //  - constants
+            //  - the return value of called functions
+            fn is_argument(&self, idx: usize) -> bool {
+                // + 1 for the return value of the function
+                0 < idx && idx < self.mir.arg_count + 1
+            }
+            fn is_constant(&self, idx: usize) -> bool {
+                idx >= self.deps.locals_count
+            }
+            fn is_return_variable(&self, idx: usize) -> bool {
+                self.is_return_variable[idx]
+            }
 
-                // fn get_callee_id(&self, id: usize) -> usize {
-                //     self.callsites
-                //         .iter()
-                //         .position(|callsite| callsite.return_variable == Some(mir::Local::from_usize(id)))
-                //         .unwrap()
-                // }
+            // fn is_callable(ty: ty::Ty) -> bool {
+            //     ty.is_fn() || ty.is_fn_ptr() || ty.is_closure()
+            // }
 
-                pub fn get_origins(&self, dependencies: &BitVec) -> Vec<Origin<'tcx>> {
-                    dependencies
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, is_dependency)| *is_dependency)
-                        .filter_map(|(id, _)| {
-                            if self.is_return_variable(id) {
-                                Some(Origin::FromReturn(mir::Local::from_usize(id)))
-                            } else if self.is_argument(id) {
-                                Some(Origin::FromArgument(mir::Local::from_usize(id)))
-                            } else if self.is_constant(id) {
-                                Some(Origin::Literal(self.deps.constant(id)))
-                            } else {
-                                // ignore local variable
-                                None
-                            }
-                        })
-                        .collect()
-                }
+            // fn get_callee_id(&self, id: usize) -> usize {
+            //     self.callsites
+            //         .iter()
+            //         .position(|callsite| callsite.return_variable == Some(mir::Local::from_usize(id)))
+            //         .unwrap()
+            // }
 
-                fn origins_from_local(&self, local: mir::Local) -> Vec<Origin<'tcx>> {
-                    self.get_origins(&self.deps.dependencies[local])
-                }
+            pub fn get_origins(&self, dependencies: &BitVec) -> Vec<Origin<'tcx>> {
+                dependencies
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, is_dependency)| *is_dependency)
+                    .filter_map(|(id, _)| {
+                        if self.is_return_variable(id) {
+                            Some(Origin::FromReturn(mir::Local::from_usize(id)))
+                        } else if self.is_argument(id) {
+                            Some(Origin::FromArgument(mir::Local::from_usize(id)))
+                        } else if self.is_constant(id) {
+                            Some(Origin::Literal(self.deps.constant(id)))
+                        } else {
+                            // ignore local variable
+                            None
+                        }
+                    })
+                    .collect()
+            }
 
-                pub fn get_source(&self, fct: &LocalCallType) -> CallType<'tcx> {
-                    use LocalCallType::*;
-                    match fct {
-                        DirectCall(def_id) => CallType::DirectCall(*def_id),
-                        // IndirectCall(def_id, local) => CallType::IndirectCall(*def_id, self.origins_from_local(*local)),
-                        LocalFunctionPtr(local) => {
-                            let origins = self.origins_from_local(*local);
-                            if origins.len() == 1 {
-                                if let Origin::Literal(cst) = origins[0] {
-                                    if let ty::TyKind::FnDef(def_id, _) = cst.ty.kind() {
-                                        CallType::DirectCall(*def_id)
-                                    } else {
-                                        panic!()
-                                    }
+            fn origins_from_local(&self, local: mir::Local) -> Vec<Origin<'tcx>> {
+                self.get_origins(&self.deps.dependencies[local])
+            }
+
+            pub fn get_source(&self, fct: &LocalCallType) -> CallType<'tcx> {
+                use LocalCallType::*;
+                match fct {
+                    DirectCall(def_id) => CallType::DirectCall(*def_id),
+                    // IndirectCall(def_id, local) => CallType::IndirectCall(*def_id, self.origins_from_local(*local)),
+                    LocalFunctionPtr(local) => {
+                        let origins = self.origins_from_local(*local);
+                        if origins.len() == 1 {
+                            if let Origin::Literal(cst) = origins[0] {
+                                if let ty::TyKind::FnDef(def_id, _) = cst.ty.kind() {
+                                    CallType::DirectCall(*def_id)
                                 } else {
-                                    CallType::FromLocalPointer(origins)
+                                    panic!()
                                 }
                             } else {
                                 CallType::FromLocalPointer(origins)
                             }
-                        },
-                    }
+                        } else {
+                            CallType::FromLocalPointer(origins)
+                        }
+                    },
                 }
             }
+        }
 
-            let xxx = XXX::new(&mir, &deps, &callsites);
-            let callees = callsites
-                .iter()
-                .map(|callsite| {
-                    Callee {
-                        function: xxx.get_source(&callsite.function),
-                        arguments_source: {
-                            let dependencies = callsite.arguments
-                                // merge the dependencies of all arguments
-                                .iter()
-                                .map(|arg| {
-                                    use mir::Operand::*;
-                                    match arg {
-                                        Copy(place) | Move(place) => deps.dependencies[place.local].clone(),
-                                        Constant(cst) => {
-                                            let mut bitmask = BitVec::from_elem(deps.locals_count + deps.constants.len(), false);
-                                            bitmask.set(deps.constants.iter().position(|cst_| cst_ == cst.literal).unwrap(), true);
-                                            bitmask
-                                        },
-                                    }
-                                })
-                                .fold(BitVec::from_elem(deps.locals_count + deps.constants.len(), false), |mut all_dependency, dependency_of_arg| {
-                                    all_dependency.or(&dependency_of_arg);
-                                    all_dependency
-                                });
-                            xxx.get_origins(&dependencies)
-                        },
-                    }
-                })
-                .collect();
-
-            (caller.to_def_id(), FunctionDependencies {
-                arguments_name_and_type,
-                callees,
+        let xxx = XXX::new(&mir, &deps, &callsites);
+        let callees = callsites
+            .iter()
+            .map(|callsite| {
+                Callee {
+                    function: xxx.get_source(&callsite.function),
+                    arguments_source: {
+                        let dependencies = callsite.arguments
+                            // merge the dependencies of all arguments
+                            .iter()
+                            .map(|arg| {
+                                use mir::Operand::*;
+                                match arg {
+                                    Copy(place) | Move(place) => deps.dependencies[place.local].clone(),
+                                    Constant(cst) => {
+                                        let mut bitmask = BitVec::from_elem(deps.locals_count + deps.constants.len(), false);
+                                        bitmask.set(deps.constants.iter().position(|cst_| cst_ == cst.literal).unwrap(), true);
+                                        bitmask
+                                    },
+                                }
+                            })
+                            .fold(BitVec::from_elem(deps.locals_count + deps.constants.len(), false), |mut all_dependency, dependency_of_arg| {
+                                all_dependency.or(&dependency_of_arg);
+                                all_dependency
+                            });
+                        xxx.get_origins(&dependencies)
+                    },
+                }
             })
+            .collect();
+
+        (caller.to_def_id(), FunctionDependencies {
+            arguments_name_and_type,
+            callees,
         })
-        .collect()
+        */
+    }
+
+    let all_dependencies = AllDependencies { functions: all_dependencies };
+    render_dependencies(tcx, all_dependencies, output)
 }
 
 pub struct SymbolAndType<'tcx> {
@@ -595,29 +662,29 @@ pub struct SymbolAndType<'tcx> {
     ty: ty::Ty<'tcx>,
 }
 
-pub enum Source {
-    FunctionId(DefId), // when taking a reference to another function
+pub enum Source<'tcx> {
+    FunctionId(ty::Const<'tcx>), // when taking a reference to another function
     Argument(mir::Local), // argument of the caller
     ReturnVariable(DefId), // return variable of another callee
 }
-pub struct CallerDependency {
-    sources: Vec<Source>,
+pub struct CallerDependency<'tcx> {
+    sources: Vec<Source<'tcx>>,
     callee: DefId,
 }
 pub struct CalleeDependency {
     called_by: DefId,
     targets: Vec<mir::Local>, // argument
 }
-struct ReturnDependency {
-    source: Source,
+struct ReturnDependency<'tcx> {
+    source: Source<'tcx>,
 }
 
 pub struct Function<'tcx> { // subgraph (crate local + external functions)
     return_ty: ty::Ty<'tcx>,
     arguments: Vec<SymbolAndType<'tcx>>,
-    caller_deps: Vec<CallerDependency>, // small blue arrows to a grey circle
+    caller_deps: Vec<CallerDependency<'tcx>>, // small blue arrows to a grey circle
     callee_deps: Vec<CalleeDependency>, // small blue arrows from a white circle
-    return_deps: Vec<ReturnDependency>, // small blue arrows to the return value
+    return_deps: Vec<ReturnDependency<'tcx>>, // small blue arrows to the return value
 }
 
 pub struct AllDependencies<'tcx> {
@@ -630,9 +697,9 @@ fn print_symbol(symbol: &Option<Symbol>) -> String {
     symbol.map(|s| html_escape::encode_text(&s.to_ident_string()).to_string()).unwrap_or_else(|| String::from("_"))
 }
 
-pub fn render_dependencies<'tcx, W: std::io::Write>(
+pub fn render_dependencies<'tcx, 'dependencies, W: std::io::Write>(
     tcx: ty::TyCtxt<'tcx>,
-    all_dependencies: AllDependencies<'tcx>,
+    all_dependencies: AllDependencies<'dependencies>,
     output: &mut W)
 -> std::io::Result<()>
 {
@@ -673,7 +740,8 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
             let ty: ty::subst::GenericArg<'_> = function.return_ty.into();
             let ty = format!("{}", ty);
             let ty = html_escape::encode_text(&ty);
-            writeln!(output, "            <td>&#8594;</td>")?;
+            let right_arrow = "&#8594;";
+            writeln!(output, "            <td> {} </td>", right_arrow)?;
             writeln!(output, "            <td port=\"return\"><font color='darkgreen'>{}</font></td>", ty)?;
         }
         writeln!(output, "            </tr></table>>")?;
@@ -693,7 +761,7 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
     }
     writeln!(output)?;
 
-    for (subgraph_id, (caller, function)) in all_dependencies.functions.iter().enumerate() {
+    for (caller, function) in all_dependencies.functions.iter() {
         let caller_name = tcx.def_path_str(*caller);
         for CallerDependency{sources, callee} in function.caller_deps.iter() {
             let callee_name = tcx.def_path_str(*callee);
@@ -701,15 +769,15 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
                 use Source::*;
                 match source {
                     FunctionId(source) => {
-                        let source_name = tcx.def_path_str(*source);
-                        writeln!(output, "    \"{}\":function -> \"{} to {}\"  [ color=\"blue\" arrowtail=empty ]", source_name, caller_name, callee_name);
+                        let source_name = source;
+                        writeln!(output, "    \"{}\":function -> \"{} to {}\"  [ color=\"blue\" arrowtail=empty ]", source_name, caller_name, callee_name)?;
                     },
                     Argument(arg) => {
-                        writeln!(output, "    \"{}\":{} -> \"{} to {}\"  [ color=\"blue\" arrowtail=empty ]", caller_name, arg.as_usize(), caller_name, callee_name);
+                        writeln!(output, "    \"{}\":{} -> \"{} to {}\"  [ color=\"blue\" arrowtail=empty ]", caller_name, arg.as_usize(), caller_name, callee_name)?;
                     },
                     ReturnVariable(previous_callee) => {
                         let previous_callee_name = tcx.def_path_str(*previous_callee);
-                        writeln!(output, "    \"{} to {}\" -> \"{} to {}\"  [ color=\"blue\" arrowtail=empty ]", caller_name, previous_callee_name, caller_name, callee_name);
+                        writeln!(output, "    \"{} to {}\" -> \"{} to {}\"  [ color=\"blue\" arrowtail=empty ]", caller_name, previous_callee_name, caller_name, callee_name)?;
                     },
                 }
             }
@@ -718,22 +786,22 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
         for CalleeDependency{called_by, targets} in function.callee_deps.iter() {
             let called_by_name = tcx.def_path_str(*called_by);
             for target in targets {
-                writeln!(output, "    \"{} from {}\" -> \"{}\":{}  [ color=\"blue\" arrowtail=empty ]", caller_name, called_by_name, caller_name, target.as_usize());
+                writeln!(output, "    \"{} from {}\" -> \"{}\":{}  [ color=\"blue\" arrowtail=empty ]", caller_name, called_by_name, caller_name, target.as_usize())?;
             }
         }
         for ReturnDependency{source} in function.return_deps.iter() {
             use Source::*;
             match source {
                 FunctionId(source) => {
-                    let source_name = tcx.def_path_str(*source);
-                    writeln!(output, "    \"{}\":function -> \"{}\":return  [ color=\"blue\" arrowtail=empty ]", source_name, caller_name);
+                    let source_name = source;
+                    writeln!(output, "    \"{}\":function -> \"{}\":return  [ color=\"blue\" arrowtail=empty ]", source_name, caller_name)?;
                 },
                 Argument(arg) => {
-                    writeln!(output, "    \"{}\":{} -> \"{}\":return  [ color=\"blue\" arrowtail=empty ]", caller_name, arg.as_usize(), caller_name);
+                    writeln!(output, "    \"{}\":{} -> \"{}\":return  [ color=\"blue\" arrowtail=empty ]", caller_name, arg.as_usize(), caller_name)?;
                 },
                 ReturnVariable(previous_callee) => {
                     let previous_callee_name = tcx.def_path_str(*previous_callee);
-                    writeln!(output, "    \"{} to {}\" -> \"{}\":return  [ color=\"blue\" arrowtail=empty ]", caller_name, previous_callee_name, caller_name);
+                    writeln!(output, "    \"{} to {}\" -> \"{}\":return  [ color=\"blue\" arrowtail=empty ]", caller_name, previous_callee_name, caller_name)?;
                 },
             }
         }

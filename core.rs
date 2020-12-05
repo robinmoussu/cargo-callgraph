@@ -33,7 +33,7 @@ use crate::clean::MAX_DEF_ID;
 use crate::clean;
 use crate::config::{Options as RustdocOptions, RenderOptions};
 use crate::config::{OutputFormat, RenderInfo};
-use crate::extract_dependencies::{extract_dependencies, render_dependencies};
+use crate::extract_dependencies::extract_and_render_dependencies;
 use crate::passes;
 
 crate use rustc_session::config::{DebuggingOptions, Input, Options};
@@ -534,10 +534,9 @@ fn run_global_ctxt(
     debug!("crate: {:?}", tcx.hir().krate());
 
     tcx.sess.time("build_call_graph", || {
-        let dependencies = extract_dependencies(tcx);
         let filename = "/home/robin/dev/cargo-callgraph/example2.dot";
         let mut output = std::fs::File::create(filename).expect("cannot create output file");
-        if let Err(err) = render_dependencies(tcx, dependencies, &mut output) {
+        if let Err(err) = extract_and_render_dependencies(tcx, &mut output) {
             eprintln!("Error when writing dependencies to {}: {}", filename, err);
         }
     });
