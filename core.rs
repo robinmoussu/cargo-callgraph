@@ -534,7 +534,7 @@ fn run_global_ctxt(
     debug!("crate: {:?}", tcx.hir().krate());
 
     tcx.sess.time("build_call_graph", || {
-        let filename = "/home/robin/dev/cargo-callgraph/example2.dot";
+        let filename = "example2.dot";
         let mut output = std::fs::File::create(filename).expect("cannot create output file");
         if let Err(err) = extract_and_render_dependencies(tcx, &mut output) {
             eprintln!("Error when writing dependencies to {}: {}", filename, err);
