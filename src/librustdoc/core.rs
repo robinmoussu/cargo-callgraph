@@ -655,12 +655,12 @@ crate fn run_global_ctxt(
 /// the name resolution pass may find errors that are never emitted.
 /// If typeck is called after this happens, then we'll get an ICE:
 /// 'Res::Error found but not reported'. To avoid this, emit the errors now.
-struct EmitIgnoredResolutionErrors<'tcx> {
+crate struct EmitIgnoredResolutionErrors<'tcx> {
     tcx: TyCtxt<'tcx>,
 }
 
 impl<'tcx> EmitIgnoredResolutionErrors<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>) -> Self {
+    crate fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self { tcx }
     }
 }

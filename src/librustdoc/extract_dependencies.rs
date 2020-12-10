@@ -1,19 +1,223 @@
-#![forbid(dead_code)]
-
-/// Extract relationship between all the locals in a function
-use bit_vec::BitVec;
-use rustc_hir::def;
-use rustc_hir::def_id::DefId;
-use rustc_index::vec::IndexVec;
-use rustc_middle::mir;
-use rustc_middle::mir::terminator::*;
-use rustc_middle::ty;
-use rustc_span::symbol::Symbol;
 use std::collections::hash_map::Entry;
+/// Extract relationship between all the locals in a function
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default::default;
 use std::fmt;
+
+use rustc_data_structures::fx::FxHashSet;
+use rustc_driver::abort_on_err;
+use rustc_feature::UnstableFeatures;
+use rustc_hir::def;
+use rustc_hir::def_id::{DefId, LocalDefId, LOCAL_CRATE};
+use rustc_hir::intravisit::Visitor;
+use rustc_index::vec::IndexVec;
+use rustc_interface::interface;
+use rustc_middle::middle::privacy::AccessLevels;
+use rustc_middle::mir;
+use rustc_middle::mir::terminator::*;
+use rustc_middle::ty;
+use rustc_session::config::{self, CrateType, Input, Options};
+use rustc_session::lint;
+use rustc_session::DiagnosticOutput;
+use rustc_span::symbol::Symbol;
+
+use bit_vec::BitVec;
+
+use crate::config::Options as RustdocOptions;
+use crate::config::RenderInfo;
+use crate::core::{init_lints, EmitIgnoredResolutionErrors};
+
+crate fn run_core(options: RustdocOptions) {
+    // Parse, resolve, and typecheck the given crate.
+
+    let RustdocOptions {
+        input,
+        crate_name,
+        proc_macro_crate,
+        error_format,
+        libs,
+        externs,
+        mut cfgs,
+        codegen_options,
+        debugging_opts,
+        target,
+        edition,
+        maybe_sysroot,
+        lint_opts,
+        describe_lints,
+        lint_cap,
+        display_warnings,
+        output_format,
+        ..
+    } = options;
+
+    // Add the doc cfg into the doc build.
+    cfgs.push("doc".to_string());
+
+    let cpath = Some(input.clone());
+    let input = Input::File(input);
+
+    let broken_intra_doc_links = lint::builtin::BROKEN_INTRA_DOC_LINKS.name;
+    let private_intra_doc_links = lint::builtin::PRIVATE_INTRA_DOC_LINKS.name;
+    let missing_docs = rustc_lint::builtin::MISSING_DOCS.name;
+    let missing_doc_example = rustc_lint::builtin::MISSING_DOC_CODE_EXAMPLES.name;
+    let private_doc_tests = rustc_lint::builtin::PRIVATE_DOC_TESTS.name;
+    let no_crate_level_docs = rustc_lint::builtin::MISSING_CRATE_LEVEL_DOCS.name;
+    let invalid_codeblock_attributes_name = rustc_lint::builtin::INVALID_CODEBLOCK_ATTRIBUTES.name;
+    let invalid_html_tags = rustc_lint::builtin::INVALID_HTML_TAGS.name;
+    let renamed_and_removed_lints = rustc_lint::builtin::RENAMED_AND_REMOVED_LINTS.name;
+    let non_autolinks = rustc_lint::builtin::NON_AUTOLINKS.name;
+    let unknown_lints = rustc_lint::builtin::UNKNOWN_LINTS.name;
+
+    // In addition to those specific lints, we also need to allow those given through
+    // command line, otherwise they'll get ignored and we don't want that.
+    let lints_to_show = vec![
+        broken_intra_doc_links.to_owned(),
+        private_intra_doc_links.to_owned(),
+        missing_docs.to_owned(),
+        missing_doc_example.to_owned(),
+        private_doc_tests.to_owned(),
+        no_crate_level_docs.to_owned(),
+        invalid_codeblock_attributes_name.to_owned(),
+        invalid_html_tags.to_owned(),
+        renamed_and_removed_lints.to_owned(),
+        unknown_lints.to_owned(),
+        non_autolinks.to_owned(),
+    ];
+
+    let (lint_opts, lint_caps) = init_lints(lints_to_show, lint_opts, |lint| {
+        // FIXME: why is this necessary?
+        if lint.name == broken_intra_doc_links || lint.name == invalid_codeblock_attributes_name {
+            None
+        } else {
+            Some((lint.name_lower(), lint::Allow))
+        }
+    });
+
+    let crate_types = if proc_macro_crate {
+        vec![CrateType::ProcMacro]
+    } else {
+        vec![CrateType::Rlib]
+    };
+    // plays with error output here!
+    let sessopts = config::Options {
+        maybe_sysroot,
+        search_paths: libs,
+        crate_types,
+        lint_opts: if !display_warnings { lint_opts } else { vec![] },
+        lint_cap,
+        cg: codegen_options,
+        externs,
+        target_triple: target,
+        unstable_features: UnstableFeatures::from_environment(crate_name.as_deref()),
+        actually_rustdoc: true,
+        debugging_opts,
+        error_format,
+        edition,
+        describe_lints,
+        crate_name,
+        ..Options::default()
+    };
+
+    let config = interface::Config {
+        opts: sessopts,
+        crate_cfg: interface::parse_cfgspecs(cfgs),
+        input,
+        input_path: cpath,
+        output_file: None,
+        output_dir: None,
+        file_loader: None,
+        diagnostic_output: DiagnosticOutput::Default,
+        stderr: None,
+        lint_caps,
+        register_lints: None,
+        override_queries: Some(|_sess, providers, _external_providers| {
+            // Most lints will require typechecking, so just don't run them.
+            providers.lint_mod = |_, _| {};
+            // Prevent `rustc_typeck::check_crate` from calling `typeck` on all bodies.
+            providers.typeck_item_bodies = |_, _| {};
+            // hack so that `used_trait_imports` won't try to call typeck
+            providers.used_trait_imports = |_, _| {
+                lazy_static! {
+                    static ref EMPTY_SET: FxHashSet<LocalDefId> = FxHashSet::default();
+                }
+                &EMPTY_SET
+            };
+            // In case typeck does end up being called, don't ICE in case there were name resolution errors
+            providers.typeck = move |tcx, def_id| {
+                // Closures' tables come from their outermost function,
+                // as they are part of the same "inference environment".
+                // This avoids emitting errors for the parent twice (see similar code in `typeck_with_fallback`)
+                let outer_def_id = tcx.closure_base_def_id(def_id.to_def_id()).expect_local();
+                if outer_def_id != def_id {
+                    return tcx.typeck(outer_def_id);
+                }
+
+                let hir = tcx.hir();
+                let body = hir.body(hir.body_owned_by(hir.local_def_id_to_hir_id(def_id)));
+                debug!("visiting body for {:?}", def_id);
+                EmitIgnoredResolutionErrors::new(tcx).visit_body(body);
+                (rustc_interface::DEFAULT_QUERY_PROVIDERS.typeck)(tcx, def_id)
+            };
+        }),
+        make_codegen_backend: None,
+        registry: rustc_driver::diagnostics_registry(),
+    };
+
+    interface::create_compiler_and_run(config, |compiler| {
+        compiler.enter(|queries| {
+            let sess = compiler.session();
+
+            if sess.has_errors() {
+                sess.fatal("Compilation failed, aborting cargo-callgraph");
+            }
+
+            let mut global_ctxt = abort_on_err(queries.global_ctxt(), sess).take();
+
+            global_ctxt.enter(|tcx| {
+                let access_levels = tcx.privacy_access_levels(LOCAL_CRATE);
+                // Convert from a HirId set to a DefId set since we don't always have easy access
+                // to the map from defid -> hirid
+                let access_levels = AccessLevels {
+                    map: access_levels
+                        .map
+                        .iter()
+                        .map(|(&k, &v)| (tcx.hir().local_def_id(k).to_def_id(), v))
+                        .collect(),
+                };
+
+                let mut renderinfo = RenderInfo::default();
+                renderinfo.access_levels = access_levels;
+                renderinfo.output_format = output_format;
+
+                tcx.sess.abort_if_errors();
+
+                let _ = tcx.sess.time("build_call_graph", || {
+                    let all_dependencies = extract_dependencies(tcx);
+                    let file = std::path::Path::new("target/doc/dependencies.dot");
+                    let mut output = std::fs::File::create(&file)
+                        .map_err(|err| {
+                            format!("cannot create output file {}: {}", file.display(), err)
+                        })
+                        .unwrap();
+                    if let Err(err) = render_dependencies(tcx, all_dependencies, &mut output) {
+                        tcx.sess.fatal(&format!(
+                            "Error when writing dependencies to {}: {}",
+                            file.display(),
+                            err
+                        ));
+                    }
+                    eprintln!(
+                        "info: dependencies have been generated in {}",
+                        file.display()
+                    );
+                });
+                tcx.sess.abort_if_errors();
+            })
+        })
+    })
+}
 
 /// Describes the dependencies of every variables
 ///

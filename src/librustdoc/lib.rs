@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 #![doc(
     html_root_url = "https://doc.rust-lang.org/nightly/",
     html_playground_url = "https://play.rust-lang.org/"
@@ -65,10 +68,7 @@ use std::default::Default;
 use std::env;
 use std::process;
 
-use rustc_driver::abort_on_err;
 use rustc_errors::ErrorReported;
-use rustc_interface::interface;
-use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{make_crate_type_option, ErrorOutputType, RustcOptGroup};
 use rustc_session::getopts;
 use rustc_session::{early_error, early_warn};
@@ -107,8 +107,8 @@ pub fn main() {
     process::exit(exit_code);
 }
 
-// Taken from
-// https://github.com/rust-lang/miri/blob/master/src/bin/miri.rs
+/// Taken from
+/// https://github.com/rust-lang/miri/blob/master/src/bin/miri.rs
 /// Returns the "default sysroot" that will be used if no `--sysroot` flag is set.
 /// Should be a compile-time constant.
 fn compile_time_sysroot() -> Option<String> {
@@ -529,29 +529,6 @@ fn wrap_return(diag: &rustc_errors::Handler, res: Result<(), String>) -> MainRes
     }
 }
 
-fn run_renderer<'tcx, T: formats::FormatRenderer<'tcx>>(
-    krate: clean::Crate,
-    renderopts: config::RenderOptions,
-    render_info: config::RenderInfo,
-    diag: &rustc_errors::Handler,
-    edition: rustc_span::edition::Edition,
-    tcx: TyCtxt<'tcx>,
-) -> MainResult {
-    match formats::run_format::<T>(krate, renderopts, render_info, &diag, edition, tcx) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let mut msg = diag.struct_err(&format!("couldn't generate documentation: {}", e.error));
-            let file = e.file.display().to_string();
-            if file.is_empty() {
-                msg.emit()
-            } else {
-                msg.note(&format!("failed to create or modify \"{}\"", file)).emit()
-            }
-            Err(ErrorReported)
-        }
-    }
-}
-
 fn main_options(options: config::Options) -> MainResult {
     let diag = core::new_handler(options.error_format, None, &options.debugging_opts);
 
@@ -567,94 +544,8 @@ fn main_options(options: config::Options) -> MainResult {
         (false, false) => {}
     }
 
-    // need to move these items separately because we lose them by the time the closure is called,
-    // but we can't create the Handler ahead of time because it's not Send
-    let diag_opts = (options.error_format, options.edition, options.debugging_opts.clone());
-    let show_coverage = options.show_coverage;
-    let run_check = options.run_check;
-
-    // First, parse the crate and extract all relevant information.
-    info!("starting to run rustc");
-
     // Interpret the input file as a rust source file, passing it through the
-    // compiler all the way through the analysis passes. The rustdoc output is
-    // then generated from the cleaned AST of the crate. This runs all the
-    // plug/cleaning passes.
-    let crate_version = options.crate_version.clone();
-
-    let default_passes = options.default_passes;
-    let output_format = options.output_format;
-    // FIXME: fix this clone (especially render_options)
-    let externs = options.externs.clone();
-    let manual_passes = options.manual_passes.clone();
-    let render_options = options.render_options.clone();
-    let config = core::create_config(options);
-
-    interface::create_compiler_and_run(config, |compiler| {
-        compiler.enter(|queries| {
-            let sess = compiler.session();
-
-            // We need to hold on to the complete resolver, so we cause everything to be
-            // cloned for the analysis passes to use. Suboptimal, but necessary in the
-            // current architecture.
-            let resolver = core::create_resolver(externs, queries, &sess);
-
-            if sess.has_errors() {
-                sess.fatal("Compilation failed, aborting rustdoc");
-            }
-
-            let mut global_ctxt = abort_on_err(queries.global_ctxt(), sess).peek_mut();
-
-            global_ctxt.enter(|tcx| {
-                let (mut krate, render_info, render_opts) = sess.time("run_global_ctxt", || {
-                    core::run_global_ctxt(
-                        tcx,
-                        resolver,
-                        default_passes,
-                        manual_passes,
-                        render_options,
-                        output_format,
-                    )
-                });
-                info!("finished with rustc");
-
-                krate.version = crate_version;
-
-                if show_coverage {
-                    // if we ran coverage, bail early, we don't need to also generate docs at this point
-                    // (also we didn't load in any of the useful passes)
-                    return Ok(());
-                } else if run_check {
-                    // Since we're in "check" mode, no need to generate anything beyond this point.
-                    return Ok(());
-                }
-
-                info!("going to format");
-                let (error_format, edition, debugging_options) = diag_opts;
-                let diag = core::new_handler(error_format, None, &debugging_options);
-                match output_format {
-                    config::OutputFormat::Html => sess.time("render_html", || {
-                        run_renderer::<html::render::Context<'_>>(
-                            krate,
-                            render_opts,
-                            render_info,
-                            &diag,
-                            edition,
-                            tcx,
-                        )
-                    }),
-                    config::OutputFormat::Json => sess.time("render_json", || {
-                        run_renderer::<json::JsonRenderer<'_>>(
-                            krate,
-                            render_opts,
-                            render_info,
-                            &diag,
-                            edition,
-                            tcx,
-                        )
-                    }),
-                }
-            })
-        })
-    })
+    // compiler all the way through the analysis passes.
+    extract_dependencies::run_core(options);
+    Ok(())
 }
