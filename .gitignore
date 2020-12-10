@@ -1,3 +1,6 @@
+# Additionnal target
+/test/*/target
+
 # Imported from git@github.com:rust-lang/rust.git
 *~
 .#*
