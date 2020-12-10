@@ -35,6 +35,7 @@ use crate::clean;
 use crate::clean::{AttributesExt, MAX_DEF_IDX};
 use crate::config::{Options as RustdocOptions, RenderOptions};
 use crate::config::{OutputFormat, RenderInfo};
+use crate::extract_dependencies::{extract_dependencies, render_dependencies};
 use crate::formats::cache::Cache;
 use crate::passes::{self, Condition::*, ConditionalPass};
 
@@ -634,8 +635,15 @@ crate fn run_global_ctxt(
 
     ctxt.sess().abort_if_errors();
 
-    // The main crate doc comments are always collapsed.
-    krate.collapsed = true;
+    let _ = tcx.sess.time("build_call_graph", || {
+        let all_dependencies = extract_dependencies(tcx);
+        let filename = "example2.dot";
+        let mut output = std::fs::File::create(filename).expect("cannot create output file");
+        if let Err(err) = render_dependencies(tcx, all_dependencies, &mut output) {
+            tcx.sess.fatal(&format!("Error when writing dependencies to {}: {}", filename, err));
+        }
+    });
+    tcx.sess.abort_if_errors();
 
     (krate, ctxt.renderinfo.into_inner(), ctxt.render_options)
 }

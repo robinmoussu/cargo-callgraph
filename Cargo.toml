@@ -20,6 +20,9 @@ tempfile = "3"
 itertools = "0.9"
 regex = "1"
 rustdoc-json-types = { path = "src/rustdoc-json-types" }
+bit-vec = "0.6.2"
+dot = "0.1.4"
+html-escape = "0.2.6"
 
 [dev-dependencies]
 expect-test = "1.0"

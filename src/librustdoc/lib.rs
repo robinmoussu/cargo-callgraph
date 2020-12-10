@@ -2,20 +2,23 @@
     html_root_url = "https://doc.rust-lang.org/nightly/",
     html_playground_url = "https://play.rust-lang.org/"
 )]
-#![feature(rustc_private)]
+#![allow(dead_code)]
 #![feature(array_methods)]
+#![feature(bool_to_option)]
 #![feature(box_patterns)]
 #![feature(box_syntax)]
-#![feature(in_band_lifetimes)]
-#![feature(nll)]
-#![feature(or_patterns)]
-#![feature(test)]
 #![feature(crate_visibility_modifier)]
-#![feature(never_type)]
-#![feature(once_cell)]
-#![feature(type_ascription)]
-#![feature(str_split_once)]
+#![feature(default_free_fn)]
+#![feature(in_band_lifetimes)]
 #![feature(iter_intersperse)]
+#![feature(never_type)]
+#![feature(nll)]
+#![feature(once_cell)]
+#![feature(or_patterns)]
+#![feature(rustc_private)]
+#![feature(str_split_once)]
+#![feature(test)]
+#![feature(type_ascription)]
 #![recursion_limit = "256"]
 #![deny(rustc::internal)]
 
@@ -80,6 +83,7 @@ mod docfs;
 mod doctree;
 #[macro_use]
 mod error;
+mod extract_dependencies;
 mod doctest;
 mod fold;
 mod formats;
