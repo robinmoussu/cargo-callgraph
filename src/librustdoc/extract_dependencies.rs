@@ -12,9 +12,6 @@ use std::collections::HashSet;
 use std::default::default;
 use std::fmt;
 
-// ************************************************************ //
-// The output of the analysis
-
 type LocalCallee = usize;
 
 /// Store all the dependencies between one function and its callee
@@ -26,18 +23,11 @@ pub struct FunctionDependencies<'tcx> {
     callees: IndexVec<LocalCallee, Callee<'tcx>>,
 }
 
-#[derive(Clone, Debug)]
-enum CallType<'tcx> {
-    DirectCall(DefId),
-    // IndirectCall(DefId, Vec<Origin<'tcx>>),
-    FromLocalPointer(Vec<Origin<'tcx>>),
-}
-
 /// Store the name of a called function and the source of all of its arguments
 #[derive(Debug, Clone)]
 pub struct Callee<'tcx> {
     /// name of the called function
-    function: CallType<'tcx>,
+    function: DefId,
     /// source (possibly over-approximated) of the source of the arguments to
     /// this called function
     arguments_source: Vec<Origin<'tcx>>,
@@ -77,6 +67,41 @@ fn extract_constant<'tcx>(mir: &mir::Body<'tcx>) -> HashSet<ty::Const<'tcx>> {
 }
 
 #[derive(Debug, Clone)]
+/// Describes the dependencies of every variables
+///
+/// Let start with an example:
+///
+/// ```no_run
+/// fn foo(arg1: i32, arg2: i32) -> i32 {
+///     let local = arg;
+///     println!("{}", arg2);
+///     local * 18;
+/// }
+/// ```
+///
+/// In this function, the return value has a direct dependency to `local`, since its value is
+/// computed from `local`. It also has a direct dependency to the constant `18`. `local` itself has
+/// a direct dependency to `arg1`. Therefore the return value has an indirect dependency to `arg1`,
+/// and the constant `18` but no dependency to `arg2`.
+///
+/// ---
+///
+/// If `dependency[local][index] == true`, then `local` has a dependency to `index`.
+///
+/// The index 0 is the return value. Then you have the arguments¹, and all other locals.
+/// The index from `locals_count` to then end of the `BitVec` are index into `constants`.
+/// For example, if `dependency[local][18] == true` and `locals_count == 15`, this means that
+/// `local` has a dependency to the 3rd (`18 - 15`) constants. For conveniency, you can use
+/// `self.constant(index)` to get the constant associated with `index`.
+///
+/// As you have guessed, each `BitVec` in `dependencies` have `constants + locals_count.len()`
+/// booleans in them. And `dependencies.len() == locals_count`².
+///
+/// ¹ The number of arguments can be accessed with `mir.arg_count`. Maybe this should be copied
+/// in this struct.
+///
+/// ² It may not be needed to store `locals_count` in this struct, since `dependencies.len()` is
+/// guaranted by construction to be equals to `locals_count`.
 struct Dependencies<'tcx> {
     pub dependencies: IndexVec<mir::Local, BitVec>,
     pub constants: Vec<ty::Const<'tcx>>,
@@ -90,6 +115,10 @@ impl<'tcx> Dependencies<'tcx> {
     }
 }
 
+/// Compute the direct dependency between local variables and constants.
+///
+/// - see [Dependencies] for more explanations.
+/// - dependencies are propagated with [propagate_dependencies].
 fn direct_dependencies<'mir, 'tcx>(mir: &'mir mir::Body<'tcx>) -> Dependencies<'tcx> {
     use mir::visit::Visitor;
 
@@ -188,6 +217,11 @@ fn direct_dependencies<'mir, 'tcx>(mir: &'mir mir::Body<'tcx>) -> Dependencies<'
     }
 }
 
+/// Propagates the dependency information computed by [direct_dependencies].
+///
+/// The input in direct dependencies, and the output are direct + indirect dependencies.
+///
+/// See [Dependencies] for more information.
 fn propagate_dependencies<'tcx>(deps: Dependencies<'tcx>) -> Dependencies<'tcx> {
     let Dependencies { mut dependencies, constants, locals_count } = deps;
 
@@ -265,9 +299,6 @@ fn propagate_dependencies<'tcx>(deps: Dependencies<'tcx>) -> Dependencies<'tcx> 
     Dependencies { dependencies, constants, locals_count }
 }
 
-// ************************************************************ //
-// Utilities
-
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Hash)]
 struct Module(String);
 
@@ -318,20 +349,24 @@ impl fmt::Display for Module {
 //     Module(crate_name + &def_path.data.iter().map(|m| format!("{}", m)).join("::"))
 // }
 
+/// Target of a function call
 #[derive(Clone, Debug)]
 enum LocalCallType {
     DirectCall(DefId),
-    // IndirectCall(DefId, mir::Local),
     LocalFunctionPtr(mir::Local),
 }
 
 #[derive(Clone, Debug)]
 struct CallSite<'tcx> {
-    return_variable: Option<mir::Local>,
+    // Target of the function call
     function: LocalCallType,
+    // Local variable where the return variable is store (if the type isn’t `()`)
+    return_variable: Option<mir::Local>,
+    // Source of each arguments passed to the function
     arguments: Vec<mir::Operand<'tcx>>,
 }
 
+// Extract information about all function call done in `mir`, where `mir` is the body of a function
 fn extract_function_call<'tcx>(tcx: ty::TyCtxt<'tcx>, mir: &mir::Body<'tcx>) -> Vec<CallSite<'tcx>> {
     use mir::visit::Visitor;
 
@@ -398,6 +433,7 @@ fn extract_function_call<'tcx>(tcx: ty::TyCtxt<'tcx>, mir: &mir::Body<'tcx>) -> 
 //     }
 // }
 
+/// Extract the information about the arguments of the function `mir`
 fn extract_arguments<'tcx>(mir: &mir::Body<'tcx>) -> Vec<SymbolAndType<'tcx>> {
     mir.args_iter()
         .map(|arg| {
@@ -418,6 +454,7 @@ fn extract_arguments<'tcx>(mir: &mir::Body<'tcx>) -> Vec<SymbolAndType<'tcx>> {
         .collect()
 }
 
+/// Test if a type is the type of a callable object
 fn is_callable(ty: &ty::TyS) -> bool {
     ty.is_fn() || ty.is_fn_ptr() || ty.is_closure()
 }
@@ -497,7 +534,7 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
             .map(|source| ReturnDependency { source })
             .collect();
 
-        let mut caller_deps = Vec::new();
+        let mut dependencies = Vec::new();
         for callsite in &callsites {
             use LocalCallType::*;
             match callsite.function {
@@ -517,7 +554,7 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
                         }
                     }
 
-                    caller_deps.push(CallerDependency {
+                    dependencies.push(CallerDependency {
                         sources,
                         callee,
                     });
@@ -533,7 +570,7 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
             entry.insert(Function {
                 return_ty,
                 arguments,
-                caller_deps,
+                dependencies,
                 return_deps,
             });
         } else {
@@ -548,7 +585,7 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
     //     .values()
     //     .map(|function| {
     //         function
-    //             .caller_deps
+    //             .dependencies
     //             .iter()
     //             .map(|CallerDependency{callee, ..}| callee )
     //     })
@@ -576,10 +613,14 @@ pub enum Source<'tcx> {
     /// return variable of another callee
     ReturnVariable(DefId),
 }
+
 pub struct CallerDependency<'tcx> {
+    // Aggregated list of indirect dependencies of all the parameters of this callee
     sources: Vec<Source<'tcx>>,
+    // function being called
     callee: DefId,
 }
+
 struct ReturnDependency<'tcx> {
     source: Source<'tcx>,
 }
@@ -587,20 +628,24 @@ struct ReturnDependency<'tcx> {
 pub struct Function<'tcx> { // subgraph (crate local + external functions)
     return_ty: ty::Ty<'tcx>,
     arguments: Vec<SymbolAndType<'tcx>>,
-    caller_deps: Vec<CallerDependency<'tcx>>, // small blue arrows to a grey circle
+    dependencies: Vec<CallerDependency<'tcx>>, // small blue arrows to a grey circle
     return_deps: Vec<ReturnDependency<'tcx>>, // small blue arrows to the return value
 }
 
 pub struct AllDependencies<'tcx> {
     // crate_name: rustc_middle::DefId, // or maybe a Symbol
     // NOTE: Do not forget to add externally defined functions
+
+    /// Informations about functions and closures defined in the current crate
     functions: HashMap<DefId, Function<'tcx>>, // calleer -> callsite
 }
 
+/// create and html-escaped string reprensentation for a given symbol
 fn print_symbol(symbol: &Option<Symbol>) -> String {
     symbol.map(|s| html_escape::encode_text(&s.to_ident_string()).to_string()).unwrap_or_else(|| String::from("_"))
 }
 
+/// Write into `output` a testual reprensentation of `all_dependencies` in dot format
 pub fn render_dependencies<'tcx, W: std::io::Write>(
     tcx: ty::TyCtxt<'tcx>,
     all_dependencies: AllDependencies<'tcx>,
@@ -653,7 +698,7 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
         writeln!(output, "        ]")?;
         writeln!(output, "        {{")?;
         writeln!(output, "            rank=same")?;
-        for CallerDependency{callee, ..} in function.caller_deps.iter() {
+        for CallerDependency{callee, ..} in function.dependencies.iter() {
             if caller != callee {
                 let callee_name = tcx.def_path_str(*callee);
                 writeln!(output, "            \"{} to {}\" [ style=filled label=\"\" width=0.2; height=0.2; shape=circle ]", caller_name, callee_name)?;
@@ -666,7 +711,7 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
 
     for (caller, function) in all_dependencies.functions.iter() {
         let caller_name = tcx.def_path_str(*caller);
-        for CallerDependency{sources, callee} in function.caller_deps.iter() {
+        for CallerDependency{sources, callee} in function.dependencies.iter() {
             let callee_name = tcx.def_path_str(*callee);
             if caller != callee {
                 writeln!(output, "    \"{}\" -> \"{} to {}\" [ style=invis minlen=0 ]", caller_name, caller_name, callee_name)?;
