@@ -466,13 +466,9 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
     let mut all_dependencies: HashMap<DefId, Function<'_>> = HashMap::new();
 
     for function in tcx.body_owners() {
-        // I'm not sure what an assoc fn is…
-        if tcx.def_kind(function) == def::DefKind::AssocFn {
-            dbg!(&function);
-        }
-
-        if !(tcx.def_kind(function) == def::DefKind::Fn || tcx.is_closure(function.to_def_id())) {
-            continue;
+        match tcx.def_kind(function) {
+            def::DefKind::Fn | def::DefKind::AssocFn | def::DefKind::Closure | def::DefKind::Generator => (),
+            _ => continue,
         }
 
         let mir = tcx.mir_built(ty::WithOptConstParam {
@@ -508,18 +504,24 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
                     } else if local <= mir.arg_count {
                         Some(Source::Argument(mir::Local::from_usize(local)))
                     } else if local < deps.locals_count {
-                         // note: dependencies to local variable are ignored
                          let local = mir::Local::from_usize(local);
                          callsites
                              .iter()
                              .find(|callsite| callsite.return_variable == Some(local))
                              .map(|callsite| {
-                                 if let LocalCallType::DirectCall(callee) = callsite.function {
-                                     Some(Source::ReturnVariable(callee))
-                                 } else {
-                                     // ignore local function pointer
-                                     // their dependencies are already propagated
-                                     None
+                                 use LocalCallType::*;
+                                 match callsite.function {
+                                     DirectCall(callee) => Some(Source::ReturnVariable(callee)),
+                                     LocalFunctionPtr(local) => {
+                                         if local.as_usize() <= mir.arg_count {
+                                             Some(Source::Argument(local))
+                                         } else {
+                                             // ignore dependencies of function pointers,
+                                             // their dependencies have been already propagated
+                                             eprintln!("warning ignoring indirect dependencies in {:?}", caller);
+                                             None
+                                         }
+                                     }
                                  }
                              })
                              .flatten()
@@ -540,33 +542,44 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
 
         let mut dependencies = Vec::new();
         for callsite in &callsites {
+            let mut sources: Vec<Source<'_>> = Vec::new();
+            for arg in &callsite.arguments {
+                use mir::Operand::*;
+                match arg {
+                    Copy(place) | Move(place) => {
+                        for source in get_origins(place.local) {
+                            sources.push(source);
+                        }
+                    },
+                    Constant(cst) => {
+                        if is_callable(cst.literal.ty) {
+                            sources.push(Source::FunctionId(*cst.literal));
+                        }
+                    }
+                }
+            }
+
             use LocalCallType::*;
             match callsite.function {
                 DirectCall(callee) => {
-                    let mut sources: Vec<Source<'_>> = Vec::new();
-                    for arg in &callsite.arguments {
-                        use mir::Operand::*;
-                        match arg {
-                            Copy(place) | Move(place) => {
-                                for source in get_origins(place.local) {
-                                    sources.push(source);
-                                }
-                            },
-                            Constant(cst) => {
-                                if is_callable(cst.literal.ty) {
-                                    sources.push(Source::FunctionId(*cst.literal));
-                                }
-                            }
-                        }
-                    }
-
                     dependencies.push(CallerDependency {
                         sources,
                         callee,
                     });
                 },
                 LocalFunctionPtr(local) => {
-                    eprintln!("warning: local function pointer has been ignored during extraction: {:?}", local);
+                    for callees in get_origins(local) {
+                        if let Source::FunctionId(callee) = callees {
+                            if let ty::FnDef(callee, ..) | ty::Closure(callee, ..) | ty::Generator(callee, ..) = callee.ty.kind() {
+                                dependencies.push(CallerDependency {
+                                    sources: sources.clone(),
+                                    callee: *callee,
+                                });
+                            } else {
+                                panic!("internal error: invalid function id: {:?}", callee);
+                            }
+                        }
+                    }
                 },
             }
         }
@@ -607,6 +620,7 @@ pub struct SymbolAndType<'tcx> {
     ty: ty::Ty<'tcx>,
 }
 
+#[derive(Clone)]
 pub enum Source<'tcx> {
     // Note: we could also track special constants, other than functions
     /// when taking a reference to another function

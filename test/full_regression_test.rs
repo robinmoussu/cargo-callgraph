@@ -71,6 +71,7 @@ pub fn call_from_argument_dyn(fct: &dyn Fn()) {
     fct()
 }
 
+// FIXME: not displayed
 pub fn call_from_argument_ptr(fct: fn()) {
     fct()
 }
@@ -96,6 +97,7 @@ pub fn call_from_wrapper_2(fct: WrapperStruct<impl Fn()>) {
     fct.call_2()
 }
 
+// FIXME: not displayed
 pub fn call_from_wrapper_deref(fct: WrapperStruct<impl Fn()>) {
     fct()
 }
@@ -157,6 +159,7 @@ pub fn call_from_argument_multiple_dyn(f1: &dyn Fn(), f2: &dyn Fn(), random: boo
     fct()
 }
 
+// FIXME: not displayed correctly
 pub fn call_from_argument_multiple_ptr(f1: fn(), f2: fn(), random: bool) {
     let fct = if random {
         f1
