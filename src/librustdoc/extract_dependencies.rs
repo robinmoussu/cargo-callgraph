@@ -761,11 +761,7 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
                     "dotted"
                 };
 
-                if caller == *callee {
-                    writeln!(output, "    \"{}\":0 -> \"{}\" [ color=black arrowhead=empty style={} ]", caller_name, caller_name, style)?;
-                } else {
-                    writeln!(output, "    \"{}\" -> \"{}\" [ color=black arrowhead=empty style={} ]", caller_name, callee_name, style)?;
-                }
+                writeln!(output, "    \"{}\" -> \"{}\" [ color=black arrowhead=empty style={} ]", caller_name, callee_name, style)?;
             }
         }
         for ReturnDependency{source} in function.return_deps.iter() {
