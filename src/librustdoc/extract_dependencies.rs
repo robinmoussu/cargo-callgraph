@@ -549,7 +549,9 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
                                 }
                             },
                             Constant(cst) => {
-                                sources.push(Source::FunctionId(*cst.literal));
+                                if is_callable(cst.literal.ty) {
+                                    sources.push(Source::FunctionId(*cst.literal));
+                                }
                             }
                         }
                     }
@@ -652,31 +654,31 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
     output: &mut W)
 -> std::io::Result<()>
 {
-    writeln!(output, "digraph {{")?;
     //let crate_name = tcx.def_path_str(all_dependencies.crate_name);
     // writeln!(output, "digraph {} {{", crate_name)?;
-    writeln!(output, "    node [ shape=none ]")?;
+    writeln!(output, "digraph {{")?;
+
+    writeln!(output, "    subgraph {{")?;
+    writeln!(output, "    node [ style=\"filled,solid\" width=10 height=1 color=black fillcolor=lightgrey ]")?;
     writeln!(output)?;
-    for (subgraph_id, (caller, function)) in all_dependencies
-        .functions
-        .iter()
-        .enumerate()
-        .map(|(id, fct)| (id + 1, fct)) // arguments id starts from 1
+
+    let mut internal_functions = HashSet::new();
+
+    for (caller, function) in &all_dependencies.functions
     {
+        internal_functions.insert(caller);
+
         let caller_name = tcx.def_path_str(*caller);
         let escaped_caller_name = html_escape::encode_text(&caller_name);
 
-        // TODO: add grouping by module?
+        // TODO: add grouping by module? Maybe using a different color
 
-        writeln!(output, "    subgraph cluster_{:03} {{", subgraph_id)?;
-        writeln!(output, "        color=grey")?;
-        writeln!(output)?;
-        writeln!(output, "        \"{}\" [ label=<<table border=\"0\" cellpadding=\"2\" cellspacing=\"0\" cellborder=\"0\"><tr>", caller_name)?;
-        writeln!(output, "            <td port=\"function\"><font color='red'>{}</font></td>", escaped_caller_name)?;
+        writeln!(output, "    \"{}\" [ label=<<table border=\"0\" cellpadding=\"2\" cellspacing=\"0\" cellborder=\"0\"><tr>", caller_name)?;
+        writeln!(output, "        <td port=\"function\"><font color='red'>{}</font></td>", escaped_caller_name)?;
         // writeln!(output, "            <td>&lt;</td>")?;
         // writeln!(output, "            <td><font color='darkgreen'>Fct</font>: Fn()</td>")?;
         // writeln!(output, "            <td>&gt;</td>")?;
-        writeln!(output, "            <td>(</td>")?;
+        writeln!(output, "        <td>(</td>")?;
         for (arg_id, SymbolAndType{symbol, ty}) in function.arguments.iter().enumerate() {
             let arg_id = arg_id + 1; // 0 is the return variable
             let symbol = print_symbol(symbol);
@@ -685,37 +687,29 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
             let ty = html_escape::encode_text(&ty);
             writeln!(output, "            <td port=\"{}\">{}: <font color='darkgreen'>{}</font></td>", arg_id, symbol, ty)?;
         }
-        writeln!(output, "            <td>)</td>")?;
+        writeln!(output, "        <td>)</td>")?;
         if !function.return_ty.is_unit() {
             let ty: ty::subst::GenericArg<'_> = function.return_ty.into();
             let ty = format!("{}", ty);
             let ty = html_escape::encode_text(&ty);
             let right_arrow = "&#8594;";
-            writeln!(output, "            <td> {} </td>", right_arrow)?;
-            writeln!(output, "            <td port=\"0\"><font color='darkgreen'>{}</font></td>", ty)?;
+            writeln!(output, "        <td> {} </td>", right_arrow)?;
+            writeln!(output, "        <td port=\"0\"><font color='darkgreen'>{}</font></td>", ty)?;
         }
-        writeln!(output, "            </tr></table>>")?;
-        writeln!(output, "        ]")?;
-        writeln!(output, "        {{")?;
-        writeln!(output, "            rank=same")?;
-        for CallerDependency{callee, ..} in function.dependencies.iter() {
-            if caller != callee {
-                let callee_name = tcx.def_path_str(*callee);
-                writeln!(output, "            \"{} to {}\" [ style=filled label=\"\" width=0.2; height=0.2; shape=circle ]", caller_name, callee_name)?;
-            }
-        }
-        writeln!(output, "        }}")?;
-        writeln!(output, "    }}")?;
+        writeln!(output, "        </tr></table>>")?;
+        writeln!(output, "    ]")?;
     }
+    writeln!(output, "    }}")?;
+    writeln!(output)?;
+    writeln!(output, "    node [ style=\"filled,dotted\" width=10 height=1 color=black fillcolor=white ]")?;
     writeln!(output)?;
 
+    let mut indirect_dependencies = HashSet::new();
     for (caller, function) in all_dependencies.functions.iter() {
         let caller_name = tcx.def_path_str(*caller);
+        let mut callees = HashSet::new();
         for CallerDependency{sources, callee} in function.dependencies.iter() {
             let callee_name = tcx.def_path_str(*callee);
-            if caller != callee {
-                writeln!(output, "    \"{}\" -> \"{} to {}\" [ style=invis minlen=0 ]", caller_name, caller_name, callee_name)?;
-            }
             for source in sources {
                 use Source::*;
                 match source {
@@ -727,21 +721,40 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
                         // ```
                         // ""crate-name"":function -> "opts to stable"  [ color=blue arrowtail=empty ]
                         // ```
-                        writeln!(output, "    \"{}\":function -> \"{} to {}\"  [ color=blue arrowtail=empty ]", source_name, caller_name, callee_name)?;
+                        if !indirect_dependencies.contains(&(source, caller)) {
+                            indirect_dependencies.insert((source, caller));
+                            writeln!(output, "    \"{}\":function -> \"{}\"  [ color=blue arrowtail=empty ]", source_name, caller_name)?;
+                        }
                     },
-                    Argument(arg) => {
-                        writeln!(output, "    \"{}\":{} -> \"{} to {}\"  [ color=blue arrowtail=empty ]", caller_name, arg.as_usize(), caller_name, callee_name)?;
+                    Argument(_arg) => {
+                        // dependencies between args add to much noice
+
+                        // writeln!(output, "    \"{}\":{} -> \"{}\"  [ color=blue arrowtail=empty ]", caller_name, arg.as_usize(), callee_name)?;
                     },
-                    ReturnVariable(previous_callee) => {
-                        let previous_callee_name = tcx.def_path_str(*previous_callee);
-                        writeln!(output, "    \"{} to {}\" -> \"{} to {}\"  [ color=blue arrowtail=empty ]", caller_name, previous_callee_name, caller_name, callee_name)?;
+                    ReturnVariable(_previous_callee) => {
+                        // dependencies between return type add to much noice
+
+                        // let previous_callee_name = tcx.def_path_str(*previous_callee);
+                        // writeln!(output, "    \"{} to {}\" -> \"{} to {}\"  [ color=blue arrowtail=empty ]", caller_name, previous_callee_name, caller_name, callee_name)?;
                     },
                 }
             }
-            if caller == callee {
-                writeln!(output, "    \"{}\":0 -> \"{}\":function [ color=\"black:invis:black\" arrowhead=empty ]", caller_name, caller_name)?;
-            } else {
-                writeln!(output, "    \"{} to {}\" -> \"{}\":function [ color=\"black:invis:black\" arrowhead=empty ]", caller_name, callee_name, callee_name)?;
+
+            // create only one arrow even if the same function is called multiple times
+            if !callees.contains(callee) {
+                callees.insert(callee);
+
+                let style = if internal_functions.contains(callee) {
+                    "solid"
+                } else {
+                    "dotted"
+                };
+
+                if caller == callee {
+                    writeln!(output, "    \"{}\":0 -> \"{}\" [ color=black arrowhead=empty style={} ]", caller_name, caller_name, style)?;
+                } else {
+                    writeln!(output, "    \"{}\" -> \"{}\" [ color=black arrowhead=empty style={} ]", caller_name, callee_name, style)?;
+                }
             }
         }
         for ReturnDependency{source} in function.return_deps.iter() {
@@ -756,14 +769,18 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
                     // ```
                     writeln!(output, "    \"{}\":function -> \"{}\":0  [ color=blue arrowtail=empty ]", source_name, caller_name)?;
                 },
-                Argument(arg) => {
-                    writeln!(output, "    \"{}\":{} -> \"{}\":0  [ color=blue arrowtail=empty ]", caller_name, arg.as_usize(), caller_name)?;
+                Argument(_arg) => {
+                    // dependencies from arguments add to much noice
+
+                    // writeln!(output, "    \"{}\":{} -> \"{}\":0  [ color=blue arrowtail=empty ]", caller_name, arg.as_usize(), caller_name)?;
                 },
-                ReturnVariable(previous_callee) => {
-                    if caller != previous_callee {
-                        let previous_callee_name = tcx.def_path_str(*previous_callee);
-                        writeln!(output, "    \"{} to {}\" -> \"{}\":0  [ color=blue arrowtail=empty ]", caller_name, previous_callee_name, caller_name)?;
-                    }
+                ReturnVariable(_previous_callee) => {
+                    // dependencies from other return type add to much noice
+
+                    // if caller != previous_callee {
+                    //     let previous_callee_name = tcx.def_path_str(*previous_callee);
+                    //     writeln!(output, "    \"{} to {}\" -> \"{}\":0  [ color=blue arrowtail=empty ]", caller_name, previous_callee_name, caller_name)?;
+                    // }
                 },
             }
         }
