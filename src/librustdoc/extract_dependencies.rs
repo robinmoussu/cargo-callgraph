@@ -12,38 +12,6 @@ use std::collections::HashSet;
 use std::default::default;
 use std::fmt;
 
-type LocalCallee = usize;
-
-/// Store all the dependencies between one function and its callee
-#[derive(Debug, Clone)]
-pub struct FunctionDependencies<'tcx> {
-    /// name and type of the returned value and all the arguments to this function
-    arguments_name_and_type: IndexVec<mir::Local, (Option<Symbol>, ty::Ty<'tcx>)>,
-    /// List of all call-sites inside the body of this function
-    callees: IndexVec<LocalCallee, Callee<'tcx>>,
-}
-
-/// Store the name of a called function and the source of all of its arguments
-#[derive(Debug, Clone)]
-pub struct Callee<'tcx> {
-    /// name of the called function
-    function: DefId,
-    /// source (possibly over-approximated) of the source of the arguments to
-    /// this called function
-    arguments_source: Vec<Origin<'tcx>>,
-}
-
-/// Express one of the possible source of a given argument
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub enum Origin<'tcx> {
-    /// A literal expression
-    Literal(ty::Const<'tcx>),
-    /// An argument of the function being analyzed
-    FromArgument(mir::Local),
-    /// The return value of a another callee
-    FromReturn(mir::Local),
-}
-
 // ************************************************************ //
 // Extract relationship between all the locals in a function
 
@@ -516,8 +484,8 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
                                          if local.as_usize() <= mir.arg_count {
                                              Some(Source::Argument(local))
                                          } else {
+                                             // FIXME:
                                              // ignore dependencies of function pointers,
-                                             // their dependencies have been already propagated
                                              eprintln!("warning ignoring indirect dependencies in {:?}", caller);
                                              None
                                          }
@@ -560,28 +528,15 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
             }
 
             use LocalCallType::*;
-            match callsite.function {
-                DirectCall(callee) => {
-                    dependencies.push(CallerDependency {
-                        sources,
-                        callee,
-                    });
-                },
-                LocalFunctionPtr(local) => {
-                    for callees in get_origins(local) {
-                        if let Source::FunctionId(callee) = callees {
-                            if let ty::FnDef(callee, ..) | ty::Closure(callee, ..) | ty::Generator(callee, ..) = callee.ty.kind() {
-                                dependencies.push(CallerDependency {
-                                    sources: sources.clone(),
-                                    callee: *callee,
-                                });
-                            } else {
-                                panic!("internal error: invalid function id: {:?}", callee);
-                            }
-                        }
-                    }
-                },
-            }
+            let callee = match callsite.function {
+                DirectCall(callee) => Callee::DirectCall(callee),
+                LocalFunctionPtr(ptr) => Callee::LocalFunctionPtr(get_origins(ptr).collect()),
+            };
+
+            dependencies.push(CallerDependency {
+                sources,
+                callee,
+            });
         }
 
         if let Entry::Vacant(entry) = all_dependencies.entry(caller) {
@@ -620,7 +575,7 @@ pub struct SymbolAndType<'tcx> {
     ty: ty::Ty<'tcx>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Source<'tcx> {
     // Note: we could also track special constants, other than functions
     /// when taking a reference to another function
@@ -633,11 +588,18 @@ pub enum Source<'tcx> {
     ReturnVariable(DefId),
 }
 
+#[derive(Debug, Clone)]
+enum Callee<'tcx> {
+    DirectCall(DefId),
+    LocalFunctionPtr(Vec<Source<'tcx>>),
+}
+
+#[derive(Debug, Clone)]
 pub struct CallerDependency<'tcx> {
-    // Aggregated list of indirect dependencies of all the parameters of this callee
+    /// Aggregated list of indirect dependencies of all the parameters of this callee
     sources: Vec<Source<'tcx>>,
-    // function being called
-    callee: DefId,
+    /// function being called
+    callee: Callee<'tcx>,
 }
 
 struct ReturnDependency<'tcx> {
@@ -739,27 +701,21 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
         let caller_name = tcx.def_path_str(caller);
         let mut callees = HashSet::new();
         for CallerDependency{sources, callee} in function.dependencies.iter() {
-            let callee_name = tcx.def_path_str(*callee);
             for source in sources {
                 use Source::*;
                 match source {
                     FunctionId(source) => {
-                        // FIXME
-                        let source_name = tcx.mk_const(*source);
-
-                        // WTF: it seems that source_name can be printed as "\"crate-name\""?
-                        // ```
-                        // ""crate-name"":function -> "opts to stable"  [ color=blue arrowtail=empty ]
-                        // ```
                         if !indirect_dependencies.contains(&(source, caller)) {
                             indirect_dependencies.insert((source, caller));
+
+                            let source_name = tcx.mk_const(*source);
                             writeln!(output, "    \"{}\":function -> \"{}\"  [ color=blue arrowtail=empty ]", source_name, caller_name)?;
                         }
                     },
-                    Argument(_arg) => {
-                        // dependencies between args add to much noice
-
-                        // writeln!(output, "    \"{}\":{} -> \"{}\"  [ color=blue arrowtail=empty ]", caller_name, arg.as_usize(), callee_name)?;
+                    Argument(arg) => {
+                        if is_callable(function.arguments[arg.as_usize() - 1].ty) {
+                            writeln!(output, "    \"{}\" -> \"{}\":{} [ color=black arrowhead=empty style=solid ]", caller_name, caller_name, arg.as_usize())?;
+                        }
                     },
                     ReturnVariable(_previous_callee) => {
                         // dependencies between return type add to much noice
@@ -770,17 +726,48 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
                 }
             }
 
-            // create only one arrow even if the same function is called multiple times
-            if !callees.contains(callee) {
-                callees.insert(callee);
+            use Callee::*;
+            match callee {
+                DirectCall(callee) => {
+                    // create only one arrow even if the same function is called multiple times
+                    if !callees.contains(callee) {
+                        callees.insert(*callee);
 
-                let style = if internal_functions.contains(callee) {
-                    "solid"
-                } else {
-                    "dotted"
-                };
+                        let style = if internal_functions.contains(callee) {
+                            "solid"
+                        } else {
+                            "dotted"
+                        };
 
-                writeln!(output, "    \"{}\" -> \"{}\" [ color=black arrowhead=empty style={} ]", caller_name, callee_name, style)?;
+                        let callee_name = tcx.def_path_str(*callee);
+                        writeln!(output, "    \"{}\" -> \"{}\" [ color=black arrowhead=empty style={} ]", caller_name, callee_name, style)?;
+                    }
+                },
+                LocalFunctionPtr(sources) => {
+                    for source in sources {
+                        use Source::*;
+                        match source {
+                            FunctionId(callee) => {
+                                // FIXME: possible dupplicates edges if multiple function pointers
+                                // points to the same function
+                                let callee_name = tcx.mk_const(*callee);
+
+                                // FIXME: detect if the callee could be an external function
+                                let style = "solid";
+
+                                writeln!(output, "    \"{}\" -> \"{}\" [ color=black arrowhead=empty style={} ]", caller_name, callee_name, style)?;
+                            },
+                            Argument(arg) => {
+                                if is_callable(function.arguments[arg.as_usize() - 1].ty) {
+                                    writeln!(output, "    \"{}\" -> \"{}\":{} [ color=black arrowhead=empty style=solid ]", caller_name, caller_name, arg.as_usize())?;
+                                }
+                            },
+                            ReturnVariable(_previous_callee) => {
+                                eprintln!("warning: call to a function pointer returned by another function was not displayed in {}", caller_name);
+                            },
+                        }
+                    }
+                }
             }
         }
         for ReturnDependency{source} in function.return_deps.iter() {
