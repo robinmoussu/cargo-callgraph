@@ -1,3 +1,5 @@
+#![forbid(dead_code)]
+
 use bit_vec::BitVec;
 use rustc_hir::def;
 use rustc_hir::def_id::DefId;
@@ -54,217 +56,233 @@ fn extract_constant<'tcx>(mir: &mir::Body<'tcx>) -> HashSet<ty::Const<'tcx>> {
 ///
 /// ---
 ///
-/// If `dependency[local][index] == true`, then `local` has a dependency to `index`.
+/// If `dependency[index][index] == true`, then `index` has a dependency to `index`.
 ///
-/// The index 0 is the return value. Then you have the arguments¹, and all other locals.
-/// The index from `locals_count` to then end of the `BitVec` are index into `constants`.
-/// For example, if `dependency[local][18] == true` and `locals_count == 15`, this means that
-/// `local` has a dependency to the 3rd (`18 - 15`) constants. For conveniency, you can use
-/// `self.constant(index)` to get the constant associated with `index`.
+/// `dependencies` is a 2D array with `dependencies.len() + constants.len()` columns.
 ///
-/// As you have guessed, each `BitVec` in `dependencies` have `constants + locals_count.len()`
-/// booleans in them. And `dependencies.len() == locals_count`².
+/// The column 0 is the return value. Then you have the arguments (from index `1` to `arg_count +
+/// 1`), then all other locals up to `dependencies.len()`. The last `constants.len()` indexes of
+/// the `BitVec` are indexes into `constants`.
 ///
-/// ¹ The number of arguments can be accessed with `mir.arg_count`. Maybe this should be copied
-/// in this struct.
-///
-/// ² It may not be needed to store `locals_count` in this struct, since `dependencies.len()` is
-/// guaranted by construction to be equals to `locals_count`.
-struct Dependencies<'tcx> {
-    pub dependencies: IndexVec<mir::Local, BitVec>,
-    pub constants: Vec<ty::Const<'tcx>>,
-    pub locals_count: usize,
+/// For example, if `dependency[index][18] == true` and `dependencies.len() == 15`, this means that
+/// `index` has a dependency to the 3rd (`18 - 15`) constant. To access it conveniently, you can
+/// use `self.constant(index)` to get the constant associated with `index`.
+pub struct Dependencies<'tcx> {
+    dependencies: IndexVec<mir::Local, BitVec>,
+    constants: Vec<ty::Const<'tcx>>,
+    arg_count: usize,
+}
+
+pub enum DependencyType<'tcx> {
+    Return,
+    Argument(mir::Local),
+    Local(mir::Local),
+    Constant(ty::Const<'tcx>),
 }
 
 impl<'tcx> Dependencies<'tcx> {
-    fn constant(&self, idx: usize) -> ty::Const<'tcx> {
-        assert!(idx >= self.locals_count);
-        self.constants[idx - self.locals_count]
-    }
-}
+    /// Compute the direct dependency between local variables and constants.
+    ///
+    /// - see [Dependencies] for more explanations.
+    /// - dependencies are propagated with [propagate].
+    fn direct_dependencies<'mir>(mir: &'mir mir::Body<'tcx>) -> Self {
+        use mir::visit::Visitor;
 
-/// Compute the direct dependency between local variables and constants.
-///
-/// - see [Dependencies] for more explanations.
-/// - dependencies are propagated with [propagate_dependencies].
-fn direct_dependencies<'mir, 'tcx>(mir: &'mir mir::Body<'tcx>) -> Dependencies<'tcx> {
-    use mir::visit::Visitor;
+        // A variable can depends from other locals or from constants
+        // The bits in `dependencies` represent a dependency to
+        //  - the return value
+        //  - the arguments of the function
+        //  - the local variables
+        //  - temporaries
+        //  - constants
+        // The index of a dependency to a constant is its index in `constants` shifted by
+        // `locals_count`.
+        let locals_count = mir.local_decls.len();
+        let constants: Vec<ty::Const<'_>> = extract_constant(mir).into_iter().collect();
+        let mut dependencies = IndexVec::from_elem_n(
+            BitVec::from_elem(locals_count + constants.len(), false),
+            locals_count);
 
-    // A variable can depends from other locals or from constants
-    // The bits in `dependencies` represent a dependency to
-    //  - the return value
-    //  - the arguments of the function
-    //  - the local variables
-    //  - temporaries
-    //  - constants
-    // The index of a dependency to a constant is its index in `constants` shifted by
-    // `locals_count`.
-    let locals_count = mir.local_decls.len();
-    let constants: Vec<ty::Const<'_>> = extract_constant(mir).into_iter().collect();
-    let mut dependencies = IndexVec::from_elem_n(
-        BitVec::from_elem(locals_count + constants.len(), false),
-        locals_count);
-
-    struct Assignments<'tcx, 'local> {
-        locals_count: usize,
-        constants: &'local Vec<ty::Const<'tcx>>,
-        dependencies: &'local mut IndexVec<mir::Local, BitVec>,
-    }
-    impl<'tcx, 'local> Assignments<'tcx, 'local> {
-        fn new(
+        struct Assignments<'tcx, 'local> {
             locals_count: usize,
             constants: &'local Vec<ty::Const<'tcx>>,
             dependencies: &'local mut IndexVec<mir::Local, BitVec>,
-        ) -> Self {
-            Assignments {
-                constants,
-                dependencies,
-                locals_count,
+        }
+        impl<'tcx, 'local> Assignments<'tcx, 'local> {
+            fn new(
+                locals_count: usize,
+                constants: &'local Vec<ty::Const<'tcx>>,
+                dependencies: &'local mut IndexVec<mir::Local, BitVec>,
+                ) -> Self {
+                Assignments {
+                    constants,
+                    dependencies,
+                    locals_count,
+                }
             }
         }
-    }
-    impl<'tcx, 'local> Visitor<'tcx> for Assignments<'tcx, 'local> {
-        fn visit_assign(
-            &mut self,
-            lvalue: &mir::Place<'tcx>,
-            rvalue: &mir::Rvalue<'tcx>,
-            _: mir::Location)
-        {
-            let lvalue = lvalue.local;
+        impl<'tcx, 'local> Visitor<'tcx> for Assignments<'tcx, 'local> {
+            fn visit_assign(
+                &mut self,
+                lvalue: &mir::Place<'tcx>,
+                rvalue: &mir::Rvalue<'tcx>,
+                _: mir::Location)
+            {
+                let lvalue = lvalue.local;
 
-            let constants = self.constants;
-            let locals_count = self.locals_count;
-            let dependencies: &mut IndexVec<mir::Local, BitVec> = self.dependencies;
+                let constants = self.constants;
+                let locals_count = self.locals_count;
+                let dependencies: &mut IndexVec<mir::Local, BitVec> = self.dependencies;
 
-            let get_id = |op: &mir::Operand<'tcx>| -> usize {
-                use mir::Operand::*;
-                match op {
-                    Copy(place) | Move(place) => {
-                        place.local.as_usize()
-                    },
-                    Constant(constant) => {
-                        locals_count + constants.iter().position(|cst| cst == constant.literal).unwrap()
-                    },
-                }
-            };
-
-            use mir::Rvalue::*;
-            match rvalue {
-                Use(op) | Repeat(op, _) | Cast(_, op, _) | UnaryOp(_, op) => {
-                    dependencies[lvalue].set(get_id(op), true);
-                },
-                Ref(_, _, place) | AddressOf(_, place) | Len(place) | Discriminant(place) => {
-                    dependencies[lvalue].set(place.local.as_usize(), true);
-                },
-                ThreadLocalRef(_) => {
-                    () // TODO:add support to threadlocal
-                },
-                BinaryOp(_, op1, op2) | CheckedBinaryOp(_, op1, op2) => {
-                    dependencies[lvalue].set(get_id(op1), true);
-                    dependencies[lvalue].set(get_id(op2), true);
-                },
-                NullaryOp(_, _) => {
-                    () // no dependencies
-                },
-                Aggregate(_, ops) => {
-                    for op in ops {
-                        dependencies[lvalue].set(get_id(op), true);
+                let get_id = |op: &mir::Operand<'tcx>| -> usize {
+                    use mir::Operand::*;
+                    match op {
+                        Copy(place) | Move(place) => {
+                            place.local.as_usize()
+                        },
+                        Constant(constant) => {
+                            locals_count + constants.iter().position(|cst| cst == constant.literal).unwrap()
+                        },
                     }
-                },
-            }
-        }
-    }
+                };
 
-    let mut search_constants = Assignments::new(locals_count, &constants, &mut dependencies);
-    search_constants.visit_body(mir);
-
-    Dependencies {
-        dependencies,
-        constants,
-        locals_count,
-    }
-}
-
-/// Propagates the dependency information computed by [direct_dependencies].
-///
-/// The input in direct dependencies, and the output are direct + indirect dependencies.
-///
-/// See [Dependencies] for more information.
-fn propagate_dependencies<'tcx>(deps: Dependencies<'tcx>) -> Dependencies<'tcx> {
-    let Dependencies { mut dependencies, constants, locals_count } = deps;
-
-    // Propagate all dependencies
-    //
-    // Example:
-    //
-    // Lets imagine that we have a function with 6 locals (return value +
-    // arguments + compiler generated constant) and two constants with the
-    // following maxtrix of direct dependencies where a cross means that the
-    // local has a value that was set from the value of the associated
-    // dependency.
-    //
-    //       | dependencies
-    // local | _0 | _1 | _2 | _3 | _4 | _5 | cst1 | cst2
-    // ------|----|----|----|----|----|----|------|------
-    //   _0  |    |    |    |  X |    |    |      |
-    //   _1  |    |    |    |    |    |    |      |
-    //   _2  |    |    |    |  X |    |    |      |  X
-    //   _3  |    |  X |  X |    |    |    |      |
-    //   _4  |    |    |    |    |    |    |  X   |
-    //   _5  |    |    |    |    |  X |    |      |
-    //
-    // The local _0 depends from _3. This means that it indirectly depends from
-    // the dependencies of _3 (_1 and _2) and transitively from the dependencies
-    // of _1 (none) and _2 (_3 and cst2). Since _3 was already visited, this
-    // will not change anything. In conclusion _0 depends from _1, _2, _3 and
-    // cst2.
-    //
-    // After applying the same logic for all local, the matrix of dependencies
-    // becomes:
-    //
-    //       | dependencies
-    // local | _0 | _1 | _2 | _3 | _4 | _5 | cst1 | cst2
-    // ------|----|----|----|----|----|----|------|------
-    //   _0  |    |  X |  X |  X |    |    |      |  X
-    //   _1  |    |    |    |    |    |    |      |
-    //   _2  |    |  X |  X |  X |    |    |      |  X
-    //   _3  |    |  X |  X |  X |    |    |      |  X
-    //   _4  |    |    |    |    |    |    |  X   |
-    //   _5  |    |    |    |    |  X |    |  X   |
-
-    let mut previous_iteration = BitVec::from_elem(locals_count + constants.len(), false);
-    // FIXME: find better name for deps1 and deps2
-    // deps1 and deps2 are refs to a BitVec of dependencies
-    // FIXME: is there a better way to do it than this bubblesort-like algorithm?
-
-    for index in 0..dependencies.len() {
-        // Safely extract a mutable reference from the dependency list, then iterate (imutably
-        // of the other dependencies
-        let (left, rest) = dependencies.raw.split_at_mut(index);
-        let (deps1, right) = rest.split_first_mut().unwrap();
-        let other_dependencies = Iterator::chain(
-            left.iter().enumerate(),
-            right.iter().enumerate().map(|(i, x)| (i + 1, x)));
-
-        loop {
-            // reuse the same BitVec at each iteration to avoid useless
-            // allocations
-            previous_iteration.clear();
-            previous_iteration.or(deps1);
-
-            for (index, deps2) in other_dependencies.clone() {
-                if deps1[index] {
-                    deps1.or(deps2);
+                use mir::Rvalue::*;
+                match rvalue {
+                    Use(op) | Repeat(op, _) | Cast(_, op, _) | UnaryOp(_, op) => {
+                        dependencies[lvalue].set(get_id(op), true);
+                    },
+                    Ref(_, _, place) | AddressOf(_, place) | Len(place) | Discriminant(place) => {
+                        dependencies[lvalue].set(place.local.as_usize(), true);
+                    },
+                    ThreadLocalRef(_) => {
+                        () // TODO:add support to threadlocal
+                    },
+                    BinaryOp(_, op1, op2) | CheckedBinaryOp(_, op1, op2) => {
+                        dependencies[lvalue].set(get_id(op1), true);
+                        dependencies[lvalue].set(get_id(op2), true);
+                    },
+                    NullaryOp(_, _) => {
+                        () // no dependencies
+                    },
+                    Aggregate(_, ops) => {
+                        for op in ops {
+                            dependencies[lvalue].set(get_id(op), true);
+                        }
+                    },
                 }
             }
+        }
 
-            // continue until we hit a stable point
-            if deps1 == &previous_iteration {
-                break;
-            }
+        let mut search_constants = Assignments::new(locals_count, &constants, &mut dependencies);
+        search_constants.visit_body(mir);
+
+        Dependencies {
+            dependencies,
+            constants,
+            arg_count: mir.arg_count,
         }
     }
-    Dependencies { dependencies, constants, locals_count }
+
+    /// Propagates the dependency information computed by [direct_dependencies].
+    ///
+    /// The input in direct dependencies, and the output are direct + indirect dependencies.
+    ///
+    /// See [Dependencies] for more information.
+    fn propagate(self) -> Self {
+        let Dependencies { mut dependencies, constants, arg_count } = self;
+
+        // Propagate all dependencies
+        //
+        // Example:
+        //
+        // Lets imagine that we have a function with 6 locals (return value +
+        // arguments + compiler generated constant) and two constants with the
+        // following maxtrix of direct dependencies where a cross means that the
+        // local has a value that was set from the value of the associated
+        // dependency.
+        //
+        //       | dependencies
+        // local | _0 | _1 | _2 | _3 | _4 | _5 | cst1 | cst2
+        // ------|----|----|----|----|----|----|------|------
+        //   _0  |    |    |    |  X |    |    |      |
+        //   _1  |    |    |    |    |    |    |      |
+        //   _2  |    |    |    |  X |    |    |      |  X
+        //   _3  |    |  X |  X |    |    |    |      |
+        //   _4  |    |    |    |    |    |    |  X   |
+        //   _5  |    |    |    |    |  X |    |      |
+        //
+        // The local _0 depends from _3. This means that it indirectly depends from
+        // the dependencies of _3 (_1 and _2) and transitively from the dependencies
+        // of _1 (none) and _2 (_3 and cst2). Since _3 was already visited, this
+        // will not change anything. In conclusion _0 depends from _1, _2, _3 and
+        // cst2.
+        //
+        // After applying the same logic for all local, the matrix of dependencies
+        // becomes:
+        //
+        //       | dependencies
+        // local | _0 | _1 | _2 | _3 | _4 | _5 | cst1 | cst2
+        // ------|----|----|----|----|----|----|------|------
+        //   _0  |    |  X |  X |  X |    |    |      |  X
+        //   _1  |    |    |    |    |    |    |      |
+        //   _2  |    |  X |  X |  X |    |    |      |  X
+        //   _3  |    |  X |  X |  X |    |    |      |  X
+        //   _4  |    |    |    |    |    |    |  X   |
+        //   _5  |    |    |    |    |  X |    |  X   |
+
+        let mut previous_iteration = BitVec::from_elem(dependencies.len() + constants.len(), false);
+        // FIXME: find better name for deps1 and deps2
+        // deps1 and deps2 are refs to a BitVec of dependencies
+        // FIXME: is there a better way to do it than this bubblesort-like algorithm?
+
+        for index in 0..dependencies.len() {
+            // Safely extract a mutable reference from the dependency list, then iterate (imutably
+            // of the other dependencies
+            let (left, rest) = dependencies.raw.split_at_mut(index);
+            let (deps1, right) = rest.split_first_mut().unwrap();
+            let other_dependencies = Iterator::chain(
+                left.iter().enumerate(),
+                right.iter().enumerate().map(|(i, x)| (i + 1, x)));
+
+            loop {
+                // reuse the same BitVec at each iteration to avoid useless
+                // allocations
+                previous_iteration.clear();
+                previous_iteration.or(deps1);
+
+                for (index, deps2) in other_dependencies.clone() {
+                    if deps1[index] {
+                        deps1.or(deps2);
+                    }
+                }
+
+                // continue until we hit a stable point
+                if deps1 == &previous_iteration {
+                    break;
+                }
+            }
+        }
+        Dependencies { dependencies, constants, arg_count }
+    }
+
+    /// Return all the dependencies to `local`
+    fn dependencies(&self, local: mir::Local) -> impl Iterator<Item=DependencyType<'tcx>> + '_ {
+        self.dependencies[local]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, depends_from)| depends_from.then_some(index))
+            .map(move |index| {
+                if index == 0 {
+                    DependencyType::Return
+                } else if index <= self.arg_count {
+                    DependencyType::Argument(mir::Local::from_usize(index))
+                } else if index < self.dependencies.len() {
+                    DependencyType::Local(mir::Local::from_usize(index))
+                } else {
+                    DependencyType::Constant(self.constants[index - self.dependencies.len()])
+                }
+            })
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Hash)]
@@ -451,8 +469,7 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
         let return_ty = mir.local_decls[mir::Local::from_usize(0)].ty;
         let arguments = extract_arguments(&mir);
 
-        let deps = direct_dependencies(&mir);
-        let deps = propagate_dependencies(deps);
+        let deps = Dependencies::direct_dependencies(&mir).propagate();
 
         let callsites: Vec<CallSite<'_>> = extract_function_call(tcx, &mir);
 
@@ -461,46 +478,46 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
         //  - constants
         //  - the return value of called functions
         let get_origins = |from: mir::Local| /* -> impl Iterator<Item=Source> */ {
-            deps.dependencies[from]
-                .iter()
-                .enumerate()
-                .filter_map(|(local, depends_from)| depends_from.then_some(local))
-                .filter_map(|local| {
-                    if local == 0 {
-                        // it's a recursive function
-                        Some(Source::ReturnVariable(caller))
-                    } else if local <= mir.arg_count {
-                        Some(Source::Argument(mir::Local::from_usize(local)))
-                    } else if local < deps.locals_count {
-                         let local = mir::Local::from_usize(local);
-                         callsites
-                             .iter()
-                             .find(|callsite| callsite.return_variable == Some(local))
-                             .map(|callsite| {
-                                 use LocalCallType::*;
-                                 match callsite.function {
-                                     DirectCall(callee) => Some(Source::ReturnVariable(callee)),
-                                     LocalFunctionPtr(local) => {
-                                         if local.as_usize() <= mir.arg_count {
-                                             Some(Source::Argument(local))
-                                         } else {
-                                             // FIXME:
-                                             // ignore dependencies of function pointers,
-                                             eprintln!("warning ignoring indirect dependencies in {:?}", caller);
-                                             None
+            deps.dependencies(from)
+                .filter_map(|dep| {
+                    use DependencyType::*;
+                    match dep {
+                        Return => {
+                            // it's a recursive function
+                            Some(Source::ReturnVariable(caller))
+                        },
+                        Argument(arg) => {
+                            Some(Source::Argument(arg))
+                        },
+                        Local(local) => {
+                             callsites
+                                 .iter()
+                                 .find(|callsite| callsite.return_variable == Some(local))
+                                 .map(|callsite| {
+                                     use LocalCallType::*;
+                                     match callsite.function {
+                                         DirectCall(callee) => Some(Source::ReturnVariable(callee)),
+                                         LocalFunctionPtr(local) => {
+                                             if local.as_usize() <= mir.arg_count {
+                                                 Some(Source::Argument(local))
+                                             } else {
+                                                 // FIXME:
+                                                 // ignore dependencies of function pointers,
+                                                 eprintln!("warning ignoring indirect dependencies in {:?}", caller);
+                                                 None
+                                             }
                                          }
                                      }
-                                 }
-                             })
-                             .flatten()
-                    } else {
-                        let cst = deps.constants[local - deps.locals_count];
-                        if is_callable(cst.ty) {
-                            Some(Source::FunctionId(cst))
-                        } else {
-                            None
+                                 })
+                                 .flatten()
+                        },
+                        Constant(cst) =>
+                            if is_callable(cst.ty) {
+                                Some(Source::FunctionId(cst))
+                            } else {
+                                None
+                            }
                         }
-                    }
                 })
         };
 
