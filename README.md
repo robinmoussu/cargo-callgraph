@@ -2,16 +2,17 @@ Compute the callgraph of a crate.
 
 ## Usage
 
-First, run `cargo-callgraph`. The output is currently `example2.dot` (it’s
+First, run `cargo-callgraph`. The output is currently `target/doc/dependencies.dot` (it’s
 hardcoded).
 
-Assuming you are on linux, you can use `dot -Txlib example2.dot` to generate an
-image from the graphviz text file.
+Assuming you are on linux, you can use `dot -Txlib target/doc/dependencies.dot`
+to generate an image from the graphviz text file.
 
-You can also use `dot -Tpng example2.dot > some_file.png` or `dot -Tpng:cairo
-example2.dot > some_file.svg` if you prefer. Note that `dot -Tsvg` has a bug the
-miscompute the size of the fonts, so you need to use `-Tsvg:cairo` instead. You
-can the use image viewer like `eog` or even `firefox` ot open the svg file.
+You can also use `dot -Tpng target/doc/dependencies.dot > some_file.png` or `dot
+-Tpng:cairo target/doc/dependencies.dot > some_file.svg` if you prefer. Note
+that `dot -Tsvg` has a bug the miscompute the size of the fonts, so you need to
+use `-Tsvg:cairo` instead. You can the use image viewer like `eog` or even
+`firefox` ot open the svg file.
 
 Instead of using `dot`, you can also use `fdp` (it's provided alongside `dot`).
 Functions will be more spread on the screen.
@@ -19,7 +20,7 @@ Functions will be more spread on the screen.
 ### Callgraph of a single file in the test directory
 
 ```sh
-cargo run -- test/test1/src/main.rs && dot example2.dot -Txlib
+cargo run -- test/test1/src/main.rs && dot target/doc/dependencies.dot -Txlib
 ```
 
 ### Callgraph of the test project.
@@ -35,7 +36,7 @@ you need to adjust `RUSTDOC` to point to the binary you just compiled.
 
 ```sh
 cd test/test1
-RUSTDOC=../../target/debug/cargo-callgraph cargo doc && dot example2.dot -Txlib
+RUSTDOC=../../target/debug/cargo-callgraph cargo doc && dot target/doc/dependencies.dot -Txlib
 ```
 
 ### Callgraph of any other project
@@ -58,7 +59,7 @@ components = ["rustc-dev", "llvm-tools-preview"]
 
 ```
 cd /your/other/crate
-RUSTDOC=/path/to/cargo-callgraph/target/debug/cargo-callgraph cargo doc && dot -Txlib
+RUSTDOC=/path/to/cargo-callgraph/target/debug/cargo-callgraph cargo doc && dot target/dot/dependencies.dot -Txlib
 ```
 
 I recommend using the `--no-deps` option, in order to limit a bit the size of

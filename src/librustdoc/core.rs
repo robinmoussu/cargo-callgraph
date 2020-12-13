@@ -637,11 +637,14 @@ crate fn run_global_ctxt(
 
     let _ = tcx.sess.time("build_call_graph", || {
         let all_dependencies = extract_dependencies(tcx);
-        let filename = "example2.dot";
-        let mut output = std::fs::File::create(filename).expect("cannot create output file");
+        let file = std::path::Path::new("target/doc/dependencies.dot");
+        let mut output = std::fs::File::create(&file)
+            .map_err(|err| format!("cannot create output file {}: {}", file.display(), err))
+            .unwrap();
         if let Err(err) = render_dependencies(tcx, all_dependencies, &mut output) {
-            tcx.sess.fatal(&format!("Error when writing dependencies to {}: {}", filename, err));
+            tcx.sess.fatal(&format!("Error when writing dependencies to {}: {}", file.display(), err));
         }
+        eprintln!("info: dependencies have been generated in {}", file.display());
     });
     tcx.sess.abort_if_errors();
 
