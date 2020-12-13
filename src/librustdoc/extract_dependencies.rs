@@ -691,7 +691,12 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
             let ty: ty::subst::GenericArg<'_> = (*ty).into();
             let ty = format!("{}", ty);
             let ty = html_escape::encode_text(&ty);
-            writeln!(output, "            <td port=\"{}\">{}: <font color='darkgreen'>{}</font></td>", arg_id, symbol, ty)?;
+            let separation = if arg_id == function.arguments.len() {
+                ""
+            } else {
+                ", "
+            };
+            writeln!(output, "            <td port=\"{}\">{}: <font color='darkgreen'>{}</font>{}</td>", arg_id, symbol, ty, separation)?;
         }
         writeln!(output, "        <td>)</td>")?;
         if !function.return_ty.is_unit() {
