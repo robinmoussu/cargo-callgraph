@@ -1,5 +1,7 @@
 #![forbid(dead_code)]
 
+/// Extract relationship between all the locals in a function
+
 use bit_vec::BitVec;
 use rustc_hir::def;
 use rustc_hir::def_id::DefId;
@@ -14,29 +16,6 @@ use std::collections::HashSet;
 use std::default::default;
 use std::fmt;
 
-// ************************************************************ //
-// Extract relationship between all the locals in a function
-
-fn extract_constant<'tcx>(mir: &mir::Body<'tcx>) -> HashSet<ty::Const<'tcx>> {
-    use mir::visit::Visitor;
-
-    #[derive(Default)]
-    struct Constants<'tcx> {
-        constants: HashSet<ty::Const<'tcx>>,
-    }
-    impl<'tcx> Visitor<'tcx> for Constants<'tcx> {
-        fn visit_constant(&mut self, constant: &mir::Constant<'tcx>, _: mir::Location) {
-            self.constants.insert(*constant.literal);
-        }
-    }
-
-    let mut search_constants = Constants::default();
-    search_constants.visit_body(mir);
-
-    search_constants.constants
-}
-
-#[derive(Debug, Clone)]
 /// Describes the dependencies of every variables
 ///
 /// Let start with an example:
@@ -67,12 +46,14 @@ fn extract_constant<'tcx>(mir: &mir::Body<'tcx>) -> HashSet<ty::Const<'tcx>> {
 /// For example, if `dependency[index][18] == true` and `dependencies.len() == 15`, this means that
 /// `index` has a dependency to the 3rd (`18 - 15`) constant. To access it conveniently, you can
 /// use `self.constant(index)` to get the constant associated with `index`.
+#[derive(Debug, Clone)]
 pub struct Dependencies<'tcx> {
     dependencies: IndexVec<mir::Local, BitVec>,
     constants: Vec<ty::Const<'tcx>>,
     arg_count: usize,
 }
 
+#[derive(Debug, Clone)]
 pub enum DependencyType<'tcx> {
     Return,
     Argument(mir::Local),
@@ -85,7 +66,7 @@ impl<'tcx> Dependencies<'tcx> {
     ///
     /// - see [Dependencies] for more explanations.
     /// - dependencies are propagated with [propagate].
-    fn direct_dependencies<'mir>(mir: &'mir mir::Body<'tcx>) -> Self {
+    fn direct_dependencies<'mir>(function: &'mir mir::Body<'tcx>) -> Self {
         use mir::visit::Visitor;
 
         // A variable can depends from other locals or from constants
@@ -97,8 +78,8 @@ impl<'tcx> Dependencies<'tcx> {
         //  - constants
         // The index of a dependency to a constant is its index in `constants` shifted by
         // `locals_count`.
-        let locals_count = mir.local_decls.len();
-        let constants: Vec<ty::Const<'_>> = extract_constant(mir).into_iter().collect();
+        let locals_count = function.local_decls.len();
+        let constants: Vec<ty::Const<'_>> = extract_constant(function).into_iter().collect();
         let mut dependencies = IndexVec::from_elem_n(
             BitVec::from_elem(locals_count + constants.len(), false),
             locals_count);
@@ -174,12 +155,12 @@ impl<'tcx> Dependencies<'tcx> {
         }
 
         let mut search_constants = Assignments::new(locals_count, &constants, &mut dependencies);
-        search_constants.visit_body(mir);
+        search_constants.visit_body(function);
 
         Dependencies {
             dependencies,
             constants,
-            arg_count: mir.arg_count,
+            arg_count: function.arg_count,
         }
     }
 
@@ -344,16 +325,90 @@ enum LocalCallType {
 
 #[derive(Clone, Debug)]
 struct CallSite<'tcx> {
-    // Target of the function call
+    /// Target of the function call
     function: LocalCallType,
-    // Local variable where the return variable is store (if the type isn’t `()`)
+    /// Local variable where the return variable is store (if the type isn’t `()`)
     return_variable: Option<mir::Local>,
-    // Source of each arguments passed to the function
+    /// Source of each arguments passed to the function
     arguments: Vec<mir::Operand<'tcx>>,
 }
 
-// Extract information about all function call done in `mir`, where `mir` is the body of a function
-fn extract_function_call<'tcx>(tcx: ty::TyCtxt<'tcx>, mir: &mir::Body<'tcx>) -> Vec<CallSite<'tcx>> {
+#[derive(Debug, Clone)]
+pub struct SymbolAndType<'tcx> {
+    symbol: Option<Symbol>,
+    ty: ty::Ty<'tcx>,
+}
+
+/// Dependencies of a given local
+///
+/// Note: we could also track special constants, other than functions
+#[derive(Debug, Clone)]
+pub enum Source<'tcx> {
+    /// a reference to another function
+    FunctionId(ty::Const<'tcx>),
+
+    /// argument of the caller
+    Argument(mir::Local),
+
+    /// return variable of another callee
+    ReturnVariable(DefId),
+}
+
+#[derive(Debug, Clone)]
+pub enum Callee<'tcx> {
+    DirectCall(DefId),
+    LocalFunctionPtr(Vec<Source<'tcx>>),
+}
+
+#[derive(Debug, Clone)]
+pub struct CallerDependency<'tcx> {
+    /// Aggregated list of indirect dependencies of all the parameters of this callee
+    sources: Vec<Source<'tcx>>,
+    /// function being called
+    callee: Callee<'tcx>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Function<'tcx> {
+    return_ty: ty::Ty<'tcx>,
+    arguments: Vec<SymbolAndType<'tcx>>,
+    dependencies: Vec<CallerDependency<'tcx>>,
+    return_deps: Vec<Source<'tcx>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AllDependencies<'tcx> {
+    // TODO:
+    // crate_name: rustc_middle::DefId, // or maybe a Symbol
+
+    // FIXME: externally defined functions are missing
+
+    /// Informations about functions and closures defined in the current crate
+    functions: HashMap<DefId, Function<'tcx>>, // calleer -> callsite
+}
+
+/// Extract all constants being used in a given function
+fn extract_constant<'tcx>(function: &mir::Body<'tcx>) -> HashSet<ty::Const<'tcx>> {
+    use mir::visit::Visitor;
+
+    #[derive(Default)]
+    struct Constants<'tcx> {
+        constants: HashSet<ty::Const<'tcx>>,
+    }
+    impl<'tcx> Visitor<'tcx> for Constants<'tcx> {
+        fn visit_constant(&mut self, constant: &mir::Constant<'tcx>, _: mir::Location) {
+            self.constants.insert(*constant.literal);
+        }
+    }
+
+    let mut search_constants = Constants::default();
+    search_constants.visit_body(function);
+
+    search_constants.constants
+}
+
+/// Extract information about all function calls in `function`
+fn extract_function_call<'tcx>(tcx: ty::TyCtxt<'tcx>, function: &mir::Body<'tcx>) -> Vec<CallSite<'tcx>> {
     use mir::visit::Visitor;
 
     #[derive(Clone)]
@@ -405,25 +460,16 @@ fn extract_function_call<'tcx>(tcx: ty::TyCtxt<'tcx>, mir: &mir::Body<'tcx>) -> 
         }
     }
 
-    let mut search_callees = SearchFunctionCall::new(tcx, &mir);
-    search_callees.visit_body(&mir);
+    let mut search_callees = SearchFunctionCall::new(tcx, &function);
+    search_callees.visit_body(&function);
     search_callees.callees
 }
 
-// fn get_generic_name(tcx: ty::TyCtxt<'_>, def_id: DefId) -> String {
-//     match tcx.opt_associated_item(def_id) {
-//         Some(ty::AssocItem{def_id, ..}) => {
-//             tcx.def_path_str(*def_id)
-//         },
-//         None => tcx.def_path_str(def_id),
-//     }
-// }
-
-/// Extract the information about the arguments of the function `mir`
-fn extract_arguments<'tcx>(mir: &mir::Body<'tcx>) -> Vec<SymbolAndType<'tcx>> {
-    mir.args_iter()
+/// Extract the information about the arguments of `function`
+fn extract_arguments<'tcx>(function: &mir::Body<'tcx>) -> Vec<SymbolAndType<'tcx>> {
+    function.args_iter()
         .map(|arg| {
-            let symbol = mir
+            let symbol = function
                 .var_debug_info
                 .iter()
                 .find(|debug| {
@@ -434,7 +480,7 @@ fn extract_arguments<'tcx>(mir: &mir::Body<'tcx>) -> Vec<SymbolAndType<'tcx>> {
                     }
                 })
                 .map(|debug| debug.name);
-            let ty = mir.local_decls[arg].ty;
+            let ty = function.local_decls[arg].ty;
             SymbolAndType{symbol, ty}
         })
         .collect()
@@ -521,9 +567,7 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
                 })
         };
 
-        let return_deps = get_origins(mir::Local::from_usize(0))
-            .map(|source| ReturnDependency { source })
-            .collect();
+        let return_deps = get_origins(mir::Local::from_usize(0)).collect();
 
         let mut dependencies = Vec::new();
         for callsite in &callsites {
@@ -568,75 +612,17 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
         }
     }
 
-    // let internal_functions: HashSet<DefId> = all_dependencies
-    //     .keys()
-    //     .collect();
-    // let external_functions: HashSet<DefId> = all_dependencies
-    //     .values()
-    //     .map(|function| {
-    //         function
-    //             .dependencies
-    //             .iter()
-    //             .map(|CallerDependency{callee, ..}| callee )
-    //     })
-    //     .flatten()
-    //     .collect();
-    // let external_functions = all_dependencies
-    //     .difference(&internal_functions);
-
     AllDependencies { functions: all_dependencies }
 }
 
-pub struct SymbolAndType<'tcx> {
-    symbol: Option<Symbol>,
-    ty: ty::Ty<'tcx>,
-}
-
-#[derive(Debug, Clone)]
-pub enum Source<'tcx> {
-    // Note: we could also track special constants, other than functions
-    /// when taking a reference to another function
-    FunctionId(ty::Const<'tcx>),
-
-    /// argument of the caller
-    Argument(mir::Local),
-
-    /// return variable of another callee
-    ReturnVariable(DefId),
-}
-
-#[derive(Debug, Clone)]
-enum Callee<'tcx> {
-    DirectCall(DefId),
-    LocalFunctionPtr(Vec<Source<'tcx>>),
-}
-
-#[derive(Debug, Clone)]
-pub struct CallerDependency<'tcx> {
-    /// Aggregated list of indirect dependencies of all the parameters of this callee
-    sources: Vec<Source<'tcx>>,
-    /// function being called
-    callee: Callee<'tcx>,
-}
-
-struct ReturnDependency<'tcx> {
-    source: Source<'tcx>,
-}
-
-pub struct Function<'tcx> { // subgraph (crate local + external functions)
-    return_ty: ty::Ty<'tcx>,
-    arguments: Vec<SymbolAndType<'tcx>>,
-    dependencies: Vec<CallerDependency<'tcx>>, // small blue arrows to a grey circle
-    return_deps: Vec<ReturnDependency<'tcx>>, // small blue arrows to the return value
-}
-
-pub struct AllDependencies<'tcx> {
-    // crate_name: rustc_middle::DefId, // or maybe a Symbol
-    // NOTE: Do not forget to add externally defined functions
-
-    /// Informations about functions and closures defined in the current crate
-    functions: HashMap<DefId, Function<'tcx>>, // calleer -> callsite
-}
+// fn get_generic_name(tcx: ty::TyCtxt<'_>, def_id: DefId) -> String {
+//     match tcx.opt_associated_item(def_id) {
+//         Some(ty::AssocItem{def_id, ..}) => {
+//             tcx.def_path_str(*def_id)
+//         },
+//         None => tcx.def_path_str(def_id),
+//     }
+// }
 
 /// create and html-escaped string reprensentation for a given symbol
 fn print_symbol(symbol: &Option<Symbol>) -> String {
@@ -787,7 +773,7 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
                 }
             }
         }
-        for ReturnDependency{source} in function.return_deps.iter() {
+        for source in function.return_deps.iter() {
             use Source::*;
             match source {
                 FunctionId(source) => {
