@@ -466,8 +466,12 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
     let mut all_dependencies: HashMap<DefId, Function<'_>> = HashMap::new();
 
     for function in tcx.body_owners() {
-        let kind = tcx.def_kind(function);
-        if kind != def::DefKind::Fn && kind != def::DefKind::Closure {
+        // I'm not sure what an assoc fn is…
+        if tcx.def_kind(function) == def::DefKind::AssocFn {
+            dbg!(&function);
+        }
+
+        if !(tcx.def_kind(function) == def::DefKind::Fn || tcx.is_closure(function.to_def_id())) {
             continue;
         }
 
@@ -562,8 +566,7 @@ pub fn extract_dependencies<'tcx>(tcx: ty::TyCtxt<'tcx>) -> AllDependencies<'tcx
                     });
                 },
                 LocalFunctionPtr(local) => {
-                    let _ = local;
-                    // TODO
+                    eprintln!("warning: local function pointer has been ignored during extraction: {:?}", local);
                 },
             }
         }
@@ -666,6 +669,9 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
 
     for (caller, function) in &all_dependencies.functions
     {
+        if tcx.is_closure(*caller) {
+            continue;
+        }
         internal_functions.insert(caller);
 
         let caller_name = tcx.def_path_str(*caller);
@@ -706,7 +712,12 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
 
     let mut indirect_dependencies = HashSet::new();
     for (caller, function) in all_dependencies.functions.iter() {
-        let caller_name = tcx.def_path_str(*caller);
+        let mut caller = *caller;
+        if tcx.is_closure(caller) {
+            caller = tcx.closure_base_def_id(caller);
+        }
+
+        let caller_name = tcx.def_path_str(caller);
         let mut callees = HashSet::new();
         for CallerDependency{sources, callee} in function.dependencies.iter() {
             let callee_name = tcx.def_path_str(*callee);
@@ -750,7 +761,7 @@ pub fn render_dependencies<'tcx, W: std::io::Write>(
                     "dotted"
                 };
 
-                if caller == callee {
+                if caller == *callee {
                     writeln!(output, "    \"{}\":0 -> \"{}\" [ color=black arrowhead=empty style={} ]", caller_name, caller_name, style)?;
                 } else {
                     writeln!(output, "    \"{}\" -> \"{}\" [ color=black arrowhead=empty style={} ]", caller_name, callee_name, style)?;
