@@ -1,1 +1,0 @@
-disallowed-methods = ["core::iter::traits::iterator::Iterator::sum", "regex::re_unicode::Regex::is_match"]
