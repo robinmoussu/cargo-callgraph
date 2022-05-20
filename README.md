@@ -2,17 +2,24 @@ Compute the callgraph of a crate.
 
 ## Usage
 
-First, run `cargo-callgraph`. The output is currently `target/doc/dependencies.dot` (it’s
+The output of `cargo-callgraph` is currently `target/doc/dependencies.dot` (it’s
 hardcoded).
 
 Assuming you are on linux, you can use `dot -Txlib target/doc/dependencies.dot`
-to generate an image from the graphviz text file.
+to generate an image from the graphviz text file. `dot` is part of [graphviz](https://www.graphviz.org/).
+You should be able to install it using your package manager (apt, pacman, brew,
+…).
 
 You can also use `dot -Tpng target/doc/dependencies.dot > some_file.png` or `dot
 -Tpng:cairo target/doc/dependencies.dot > some_file.svg` if you prefer. Note
 that `dot -Tsvg` has a bug the miscompute the size of the fonts, so you need to
 use `-Tsvg:cairo` instead. You can the use image viewer like `eog` or even
 `firefox` ot open the svg file.
+
+The `-Txlib` backend of graphviz, while very convenient on Linux (you don’t need
+to have a intermediate png file) doesn’t work on mac. In that case you must use
+the `-Tpng` option instead. On linux you can open a png file with
+`xdg-open my-graph.png` and on mac you can do the same with `open my-graph.png`.
 
 Instead of using `dot`, you can also use `fdp` (it's provided alongside `dot`).
 Functions will be more spread on the screen.
@@ -21,6 +28,12 @@ Functions will be more spread on the screen.
 
 ```sh
 cargo run -- test/test1/src/main.rs && dot target/doc/dependencies.dot -Txlib
+```
+
+On mac, use instead
+
+```sh
+cargo run -- test/test1/src/main.rs && dot target/doc/dependencies.dot -Tpng > graph.png && open graph.png
 ```
 
 ![generated call-graph for the a single file](ressources/test-project.png)
@@ -39,6 +52,13 @@ you need to adjust `RUSTDOC` to point to the binary you just compiled.
 ```sh
 cd test/test1
 env RUSTDOC=../../target/debug/cargo-callgraph cargo doc && dot target/doc/dependencies.dot -Txlib
+```
+
+on mac, use instead
+
+```sh
+cd test/test1
+env RUSTDOC=../../target/debug/cargo-callgraph cargo doc && dot target/doc/dependencies.dot -Tpng > graph.png && open graph.png
 ```
 
 ![generated call-graph for the test project](ressources/single-file.png)
