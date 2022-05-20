@@ -59,10 +59,21 @@ components = ["rustc-dev", "llvm-tools-preview"]
 
 ```
 cd /your/other/crate
-RUSTDOC=/path/to/cargo-callgraph/target/debug/cargo-callgraph cargo doc && dot target/dot/dependencies.dot -Txlib
+RUSTDOC=/path/to/cargo-callgraph/target/debug/cargo-callgraph cargo doc && dot -Txlib target/dot/dependencies.dot
+env RUSTDOC=/Users/robinm/perso/cargo-callgraph/target/debug/cargo-callgraph cargo doc && dot /Users/robinm/perso/cargo-callgraph/target/dot/dependencies.dot -Tpng > x.png && open x.png
 ```
 
 I recommend using the `--no-deps` option, in order to limit a bit the size of
 the output. `dot` (or `fdp` for that matter) is very slow with huge graphs.
 
+## License
 
+Since this is a fork of rustc, this project is distributed using the same
+licenses.
+
+Rust is primarily distributed under the terms of both the MIT license
+and the Apache License (Version 2.0), with portions covered by various
+BSD-like licenses.
+
+See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT), and
+[COPYRIGHT](COPYRIGHT) for details.
