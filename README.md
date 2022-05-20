@@ -23,6 +23,8 @@ Functions will be more spread on the screen.
 cargo run -- test/test1/src/main.rs && dot target/doc/dependencies.dot -Txlib
 ```
 
+![generated call-graph for the a single file](ressources/test-project.png)
+
 ### Callgraph of the test project.
 
 First you need to build (either in debug or release mode `cargo-callgraph`.
@@ -36,8 +38,10 @@ you need to adjust `RUSTDOC` to point to the binary you just compiled.
 
 ```sh
 cd test/test1
-RUSTDOC=../../target/debug/cargo-callgraph cargo doc && dot target/doc/dependencies.dot -Txlib
+env RUSTDOC=../../target/debug/cargo-callgraph cargo doc && dot target/doc/dependencies.dot -Txlib
 ```
+
+![generated call-graph for the test project](ressources/single-file.png)
 
 ### Callgraph of any other project
 
